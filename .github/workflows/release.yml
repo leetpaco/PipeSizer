@@ -1,0 +1,47 @@
+name: Release
+
+# Triggered by pushing a version tag (vX.Y.Z). Builds, packages the DLLs,
+# writes version.json with SHA256 hashes, and creates the GitHub Release
+# that installed copies of the add-in update from.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet build src/PipeSizer.sln -c Release
+      - name: Package release assets
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $version = $tag.TrimStart('v')
+          $out = "src/PipeSizer/bin/Release/net8.0-windows"
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item "$out/PipeSizer.dll" release-assets/
+          Copy-Item "$out/PipeSizer.Sizing.dll" release-assets/
+          Copy-Item "PipeSizer.addin" release-assets/
+          $h1 = (Get-FileHash "release-assets/PipeSizer.dll" -Algorithm SHA256).Hash.ToLower()
+          $h2 = (Get-FileHash "release-assets/PipeSizer.Sizing.dll" -Algorithm SHA256).Hash.ToLower()
+          $base = "https://github.com/leetpaco/PipeSizer/releases/download/$tag"
+          $obj = [ordered]@{
+            version = $version
+            assets = [ordered]@{
+              "PipeSizer.dll" = [ordered]@{ url = "$base/PipeSizer.dll"; sha256 = $h1 }
+              "PipeSizer.Sizing.dll" = [ordered]@{ url = "$base/PipeSizer.Sizing.dll"; sha256 = $h2 }
+            }
+          }
+          $obj | ConvertTo-Json -Depth 4 | Out-File -Encoding utf8 release-assets/version.json
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" release-assets/PipeSizer.dll release-assets/PipeSizer.Sizing.dll release-assets/PipeSizer.addin release-assets/version.json --title "$env:GITHUB_REF_NAME" --notes "PipeSizer $env:GITHUB_REF_NAME — see README for install and changelog."
