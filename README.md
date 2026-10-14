@@ -43,6 +43,15 @@ the next startup applies them. No network (or any error) silently skips
 the check — startup is never blocked. Stale versioned DLLs are cleaned up
 on startup.
 
+The panel header always shows the running version
+("PipeSizer — v1.1.2 — live pipe sizing check"), so you can see at a glance
+which build is loaded. When a startup update is staged, Revit also shows a
+"PipeSizer Update" dialog once on first idle ("Update vX.Y.Z downloaded —
+restart Revit to apply") — OK button only, no restart button, since closing
+Revit programmatically risks unsaved work. A **Check for updates** click
+shows its outcome as a dialog too, so the result is visible even if the
+pane gets closed.
+
 ## Cutting a release
 
 1. Bump `<Version>` (and `<AssemblyVersion>`) in the three `.csproj` files.

@@ -181,6 +181,16 @@ Eq(PipeSizer.Updater.ParseVersionFromTag("1.1.0"), "1.1.0", "updater tag no pref
 Eq(PipeSizer.Updater.ParseVersionFromTag(null), null, "updater tag null");
 Eq(PipeSizer.Updater.ParseVersionFromTag(""), null, "updater tag empty");
 
+Eq(PipeSizer.Updater.DisplayVersion(new Version(1, 1, 2, 0)), "1.1.2", "updater display version drops .0 revision");
+Eq(PipeSizer.Updater.DisplayVersion(new Version(1, 1, 2, 3)), "1.1.2.3", "updater display version keeps nonzero revision");
+Eq(PipeSizer.Updater.DisplayVersion(new Version(2, 0, 0, 0)), "2.0.0", "updater display version 2.0.0");
+Eq(PipeSizer.Updater.DisplayVersion(null), "unknown", "updater display version null");
+
+Eq(PipeSizer.Updater.DialogText(PipeSizer.UpdateOutcome.Staged("1.1.2")), "Update v1.1.2 downloaded — restart Revit to apply.", "updater dialog staged");
+Eq(PipeSizer.Updater.DialogText(PipeSizer.UpdateOutcome.AlreadyCurrent("1.1.1")), "You're on the latest version (v1.1.1).", "updater dialog already current");
+Eq(PipeSizer.Updater.DialogText(PipeSizer.UpdateOutcome.Failed("boom")), "Update check failed: boom", "updater dialog failed");
+Eq(PipeSizer.Updater.DialogText(PipeSizer.UpdateOutcome.Noop()), "No update available.", "updater dialog noop");
+
 byte[] abc = System.Text.Encoding.UTF8.GetBytes("abc");
 Eq(PipeSizer.Updater.ComputeSha256Hex(abc), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "updater sha256 abc");
 Check(PipeSizer.Updater.VerifySha256(abc, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"), "updater sha verify match");

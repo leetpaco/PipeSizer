@@ -41,6 +41,10 @@ public class App : IExternalApplication
     private static bool _autoShowPanePending;
     private static bool _autoShowRequested;
     private static bool _autoShow;
+    private static bool _startupUpdateDialogPending;
+    private static bool _startupUpdateDialogRequested;
+    private static bool _showStartupUpdateDialog;
+    private static string? _startupUpdateNotice;
     private static readonly HashSet<ElementId> _changedAdded = new();
     private static readonly HashSet<ElementId> _changedModified = new();
     private static readonly HashSet<ElementId> _changedDeleted = new();
@@ -53,8 +57,9 @@ public class App : IExternalApplication
     private static readonly string StartupLogPath =
         Path.Combine(Path.GetTempPath(), "PipeSizer-startup.log");
 
-    /// <summary>Appends one line to the startup log. Never throws, never blocks startup.</summary>
-    private static void StartupLog(string message)
+    /// <summary>Appends one line to the startup log. Never throws, never blocks startup.
+    /// Internal so the event handler can log dialog failures too.</summary>
+    internal static void StartupLog(string message)
     {
         try
         {
@@ -78,6 +83,19 @@ public class App : IExternalApplication
             var outcome = Updater.RunStartupUpdate();
             updateNotice = outcome.Notice;
             StartupLog("Updater: " + (outcome.Notice ?? outcome.Error ?? "no update"));
+            if (outcome.UpdateStaged)
+            {
+                // An update was actually staged (downloaded + manifest rewritten).
+                // The TaskDialog announcing it is deferred to the first Idling run
+                // (below): never shown during OnStartup, when Revit's main window
+                // may not be ready. Normal launches (no update) never show it.
+                lock (Sync)
+                {
+                    _startupUpdateNotice = outcome.Notice;
+                    _startupUpdateDialogPending = true;
+                }
+                StartupLog("Startup update staged — dialog will show on first Idling run.");
+            }
         }
         catch (Exception ex)
         {
@@ -192,6 +210,14 @@ public class App : IExternalApplication
                 _autoShow = true;
                 raise = true;
             }
+            // Startup-update dialog: first Idling run after the startup updater
+            // staged a new version (consumed once; normal launches never raise).
+            if (_startupUpdateDialogPending && !_startupUpdateDialogRequested)
+            {
+                _startupUpdateDialogRequested = true;
+                _showStartupUpdateDialog = true;
+                raise = true;
+            }
             if (_pendingSelect is not null)
             {
                 raise = true; // retry a select whose first raise never executed
@@ -267,7 +293,17 @@ public class App : IExternalApplication
             try
             {
                 Panel?.Dispatcher.Invoke(() =>
-                    Panel.ShowUpdateNotice(outcome.Notice ?? outcome.Error ?? "No update available."));
+                {
+                    Panel.ShowUpdateNotice(outcome.Notice ?? outcome.Error ?? "No update available.");
+                    // Same outcome as a TaskDialog, so the result is visible even
+                    // if the pane gets closed. OK button only — no restart button:
+                    // closing Revit programmatically risks unsaved work.
+                    try
+                    {
+                        TaskDialog.Show("PipeSizer Update", Updater.DialogText(outcome));
+                    }
+                    catch { /* panel notice already shown */ }
+                });
             }
             catch { /* panel gone */ }
         });
@@ -281,7 +317,7 @@ public class App : IExternalApplication
     /// </summary>
     internal static (bool ManualCheck, bool AutoCheck, ElementId? SelectId, bool SelectZoom,
         HashSet<ElementId> Added, HashSet<ElementId> Modified, HashSet<ElementId> Deleted,
-        bool AutoShow) TakeWork()
+        bool AutoShow, string? StartupUpdateNotice) TakeWork()
     {
         lock (Sync)
         {
@@ -290,6 +326,8 @@ public class App : IExternalApplication
             var selectId = _pendingSelect;
             bool zoom = _pendingSelectZoom;
             bool autoShow = _autoShow;
+            bool showStartupUpdateDialog = _showStartupUpdateDialog;
+            string? startupUpdateNotice = showStartupUpdateDialog ? _startupUpdateNotice : null;
             HashSet<ElementId> added, modified, deleted;
             if (auto)
             {
@@ -311,8 +349,10 @@ public class App : IExternalApplication
             _pendingSelect = null;
             _pendingSelectZoom = false;
             _autoShow = false;
+            _showStartupUpdateDialog = false;
+            _startupUpdateNotice = null;
             _checkRunning = true;
-            return (manual, auto, selectId, zoom, added, modified, deleted, autoShow);
+            return (manual, auto, selectId, zoom, added, modified, deleted, autoShow, startupUpdateNotice);
         }
     }
 
@@ -329,7 +369,7 @@ public class CheckEventHandler : IExternalEventHandler
     {
         try
         {
-            var (manual, auto, selectId, selectZoom, added, modified, deleted, autoShow) = App.TakeWork();
+            var (manual, auto, selectId, selectZoom, added, modified, deleted, autoShow, startupUpdateNotice) = App.TakeWork();
             var uidoc = app.ActiveUIDocument;
 
             // Ribbon-fallback: ribbon creation failed at startup, so show the
@@ -344,6 +384,23 @@ public class CheckEventHandler : IExternalEventHandler
                 catch (Exception ex)
                 {
                     App.Panel?.ShowError("Could not show pane: " + ex.Message);
+                }
+            }
+
+            // Startup-update dialog: the startup updater staged a new version
+            // (downloaded + manifest rewritten). Runs on the Revit thread via
+            // this ExternalEvent, never during OnStartup. OK button only — no
+            // restart button: closing Revit programmatically risks unsaved work.
+            // Runs regardless of whether a document is open.
+            if (startupUpdateNotice is not null)
+            {
+                try
+                {
+                    TaskDialog.Show("PipeSizer Update", startupUpdateNotice);
+                }
+                catch (Exception ex)
+                {
+                    App.StartupLog("Startup update dialog FAILED: " + ex.GetType().Name + ": " + ex.Message);
                 }
             }
 

@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -127,7 +128,9 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
 
         var header = new TextBlock
         {
-            Text = "PipeSizer — live pipe sizing check",
+            // Version read at runtime from the executing assembly — never hardcoded,
+            // so the header always shows the build actually running.
+            Text = $"PipeSizer — v{Updater.DisplayVersion(Assembly.GetExecutingAssembly().GetName().Version)} — live pipe sizing check",
             FontWeight = FontWeights.Bold,
             FontSize = 13,
             Margin = new Thickness(0, 0, 0, 6),

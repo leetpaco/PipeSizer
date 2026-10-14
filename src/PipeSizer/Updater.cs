@@ -89,6 +89,34 @@ public static class Updater
         return tag.Length == 0 ? null : tag;
     }
 
+    /// <summary>Display form of an AssemblyVersion: "1.1.2" for 1.1.2.0 (trailing
+    /// .0 revision dropped), "1.1.2.3" when the revision is nonzero. Null -> "unknown".
+    /// Used for the panel header, read at runtime — never hardcoded.</summary>
+    public static string DisplayVersion(Version? version)
+    {
+        if (version is null)
+            return "unknown";
+        if (version.Build < 0)
+            return $"{version.Major}.{version.Minor}";
+        string text = $"{version.Major}.{version.Minor}.{version.Build}";
+        return version.Revision > 0 ? text + "." + version.Revision : text;
+    }
+
+    /// <summary>TaskDialog text for an update-check outcome: the staged notice when
+    /// an update was staged, the error on failure, "You're on the latest version
+    /// (vX)." when already current, else the notice. Pure logic, so the panel and
+    /// the startup dialog share one wording.</summary>
+    public static string DialogText(UpdateOutcome outcome)
+    {
+        if (outcome.UpdateStaged)
+            return outcome.Notice ?? $"Update v{outcome.Version} downloaded — restart Revit to apply.";
+        if (outcome.Error is not null)
+            return outcome.Error;
+        if (outcome.Version is not null)
+            return $"You're on the latest version (v{outcome.Version}).";
+        return outcome.Notice ?? "No update available.";
+    }
+
     public static string ComputeSha256Hex(byte[] data) =>
         Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant();
 
