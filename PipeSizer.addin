@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>PipeSizer</Name>
+    <Assembly>PipeSizer.dll</Assembly>
+    <AddInId>535616f7-caa7-4755-bdc5-c66058691afb</AddInId>
+    <FullClassName>PipeSizer.App</FullClassName>
+    <VendorId>PipeSizer</VendorId>
+    <VendorDescription>Live pipe-sizing checker for Revit (hydronic, domestic water, natural gas). Check-only: never modifies the model.</VendorDescription>
+  </AddIn>
+</RevitAddIns>
