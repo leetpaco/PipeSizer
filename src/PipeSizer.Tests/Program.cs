@@ -165,6 +165,54 @@ Eq(SizeLabels.Format(1.5), "1-1/2\"", "size label 1.5");
 Eq(Materials.Resolve("copper").Material, Materials.CopperTypeL, "material alias copper");
 Eq(Materials.Resolve("nonsense").Material, Materials.CopperTypeL, "material default copper");
 Console.WriteLine("shared: PASS");
+
+// --- Manual flow overrides (PipeSizer.FlowOverrides) ---
+Check(PipeSizer.FlowOverrides.TryParseFlow("24", out double pf1) && pf1 == 24, "override parse 24");
+Check(PipeSizer.FlowOverrides.TryParseFlow(" 12.5 ", out double pf2) && pf2 == 12.5, "override parse whitespace 12.5");
+Check(!PipeSizer.FlowOverrides.TryParseFlow("0", out _), "override parse 0 rejected");
+Check(!PipeSizer.FlowOverrides.TryParseFlow("-3", out _), "override parse -3 rejected");
+Check(!PipeSizer.FlowOverrides.TryParseFlow("abc", out _), "override parse abc rejected");
+Check(!PipeSizer.FlowOverrides.TryParseFlow("", out _), "override parse empty rejected");
+Check(!PipeSizer.FlowOverrides.TryParseFlow(null, out _), "override parse null rejected");
+Check(!PipeSizer.FlowOverrides.TryParseFlow("NaN", out _), "override parse NaN rejected");
+Check(!PipeSizer.FlowOverrides.TryParseFlow("Infinity", out _), "override parse Infinity rejected");
+
+Eq(PipeSizer.FlowOverrides.UnitLabel(PipeSizer.PipeCategory.Hydronic, GasFuel.NaturalGas), "GPM", "override unit hydronic");
+Eq(PipeSizer.FlowOverrides.UnitLabel(PipeSizer.PipeCategory.Domestic, GasFuel.NaturalGas), "GPM", "override unit domestic");
+Eq(PipeSizer.FlowOverrides.UnitLabel(PipeSizer.PipeCategory.Gas, GasFuel.NaturalGas), "CFH", "override unit gas NG");
+Eq(PipeSizer.FlowOverrides.UnitLabel(PipeSizer.PipeCategory.Gas, GasFuel.Propane), "MBH", "override unit gas propane");
+
+var ngCfg = GasConfig.Default;
+var lpCfg = new GasConfig(GasFuel.Propane, GasPressure.Low, GasMaterial.Metallic);
+double revit24gpm = 24 / PipeSizer.FlowOverrides.M3sToGpm;
+double revit100cfh = 100 / PipeSizer.FlowOverrides.M3sToCfh;
+// Override beats Revit flow
+Eq(PipeSizer.FlowOverrides.Resolve(revit24gpm, 50, PipeSizer.PipeCategory.Hydronic, ngCfg), 50.0, "override beats revit flow");
+// Override rescues a no-flow pipe (null and zero Revit flow)
+Eq(PipeSizer.FlowOverrides.Resolve(null, 30, PipeSizer.PipeCategory.Domestic, ngCfg), 30.0, "override rescues null revit flow");
+Eq(PipeSizer.FlowOverrides.Resolve(0.0, 30, PipeSizer.PipeCategory.Domestic, ngCfg), 30.0, "override rescues zero revit flow");
+// No override: Revit flow converted
+Near(PipeSizer.FlowOverrides.Resolve(revit24gpm, null, PipeSizer.PipeCategory.Hydronic, ngCfg)!.Value, 24.0, 0.001, "override none -> revit gpm");
+Near(PipeSizer.FlowOverrides.Resolve(revit100cfh, null, PipeSizer.PipeCategory.Gas, ngCfg)!.Value, 100.0, 0.001, "override none -> revit cfh");
+Near(PipeSizer.FlowOverrides.Resolve(revit100cfh, null, PipeSizer.PipeCategory.Gas, lpCfg)!.Value, 250.0, 0.001, "override none -> revit propane mbh");
+// No flow at all
+Eq(PipeSizer.FlowOverrides.Resolve(null, null, PipeSizer.PipeCategory.Hydronic, ngCfg), null, "override none + null revit -> null");
+// Invalid override falls through to Revit flow
+Near(PipeSizer.FlowOverrides.Resolve(revit24gpm, 0, PipeSizer.PipeCategory.Hydronic, ngCfg)!.Value, 24.0, 0.001, "override 0 falls through");
+Near(PipeSizer.FlowOverrides.Resolve(revit24gpm, -5, PipeSizer.PipeCategory.Hydronic, ngCfg)!.Value, 24.0, 0.001, "override -5 falls through");
+// Ignore category: no-op even with an override
+Eq(PipeSizer.FlowOverrides.Resolve(revit24gpm, 50, PipeSizer.PipeCategory.Ignore, ngCfg), null, "override ignore + revit -> null");
+Eq(PipeSizer.FlowOverrides.Resolve(null, 50, PipeSizer.PipeCategory.Ignore, ngCfg), null, "override ignore + null -> null");
+// Clearing: removing the dict entry restores Revit flow
+var flowDict = new Dictionary<long, double> { [123] = 50 };
+Eq(PipeSizer.FlowOverrides.Resolve(revit24gpm, flowDict.TryGetValue(123, out double ov) ? ov : null, PipeSizer.PipeCategory.Hydronic, ngCfg), 50.0, "override dict present");
+flowDict.Remove(123);
+Near(PipeSizer.FlowOverrides.Resolve(revit24gpm, flowDict.TryGetValue(123, out double ov2) ? ov2 : null, PipeSizer.PipeCategory.Hydronic, ngCfg)!.Value, 24.0, 0.001, "override cleared -> revit flow");
+
+// Propane inverse conversion
+Near(GasSizing.PropaneMbhToCfh(250), 100.0, 0.001, "propane 250 MBH = 100 CFH");
+Near(GasSizing.CfhToPropaneMbh(GasSizing.PropaneMbhToCfh(123.4)), 123.4, 0.001, "propane mbh/cfh round-trip");
+Console.WriteLine("flow overrides: PASS");
 Console.WriteLine("ALL SIZING TESTS PASSED");
 
 // --- Updater: version compare / parse, SHA256, manifest rewrite, guards, staging ---
@@ -283,4 +331,55 @@ Eq(XDocument.Load(Path.Combine(tmpBad, "PipeSizer.addin")).Descendants("Assembly
 Directory.Delete(tmpBad, true);
 
 Console.WriteLine("updater: PASS");
+
+// --- On-demand update hardening: AlreadyStaged + pending-update detection ---
+var alreadyStaged = PipeSizer.UpdateOutcome.AlreadyStaged("1.2.0");
+Check(alreadyStaged.UpdateStaged, "updater already-staged flag");
+Eq(alreadyStaged.Notice, "Update v1.2.0 already downloaded — restart Revit to apply.", "updater already-staged notice");
+Eq(PipeSizer.Updater.DialogText(alreadyStaged), "Update v1.2.0 already downloaded — restart Revit to apply.", "updater dialog already-staged");
+
+// GetPendingUpdateVersion: valid staged bundle in update-staging/
+string tmpPend = Path.Combine(Path.GetTempPath(), "PipeSizer-pend-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(tmpPend);
+string pendStaging = Path.Combine(tmpPend, "update-staging");
+Directory.CreateDirectory(pendStaging);
+byte[] pendMain = System.Text.Encoding.UTF8.GetBytes("pending-main-1.2.0");
+byte[] pendSizing = System.Text.Encoding.UTF8.GetBytes("pending-sizing-1.2.0");
+string pendMainSha = PipeSizer.Updater.ComputeSha256Hex(pendMain);
+string pendSizingSha = PipeSizer.Updater.ComputeSha256Hex(pendSizing);
+File.WriteAllText(Path.Combine(pendStaging, "version.json"),
+    $"{{\"version\": \"1.2.0\", \"assets\": {{\"PipeSizer.dll\": {{\"url\": \"\", \"sha256\": \"{pendMainSha}\"}}, \"PipeSizer.Sizing.dll\": {{\"url\": \"\", \"sha256\": \"{pendSizingSha}\"}}}}}}");
+File.WriteAllBytes(Path.Combine(pendStaging, "PipeSizer.1.2.0.dll"), pendMain);
+File.WriteAllBytes(Path.Combine(pendStaging, "PipeSizer.Sizing.dll"), pendSizing);
+Eq(PipeSizer.Updater.GetPendingUpdateVersion(tmpPend, "1.1.0"), "1.2.0", "updater pending staged bundle");
+Eq(PipeSizer.Updater.GetPendingUpdateVersion(tmpPend, "1.2.0"), null, "updater pending staged not newer than current");
+Eq(PipeSizer.Updater.GetPendingUpdateVersion(tmpPend, "1.3.0"), null, "updater pending staged older than current");
+// Corrupt staging (SHA mismatch) is ignored
+File.WriteAllBytes(Path.Combine(pendStaging, "PipeSizer.1.2.0.dll"), System.Text.Encoding.UTF8.GetBytes("tampered"));
+Eq(PipeSizer.Updater.GetPendingUpdateVersion(tmpPend, "1.1.0"), null, "updater pending corrupt staging ignored");
+Directory.Delete(tmpPend, true);
+
+// GetPendingUpdateVersion: manifest already points at a newer versioned DLL
+string tmpMan = Path.Combine(Path.GetTempPath(), "PipeSizer-pendman-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(tmpMan);
+File.WriteAllText(Path.Combine(tmpMan, "PipeSizer.addin"),
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><RevitAddIns><AddIn Type=\"Application\"><Name>PipeSizer</Name><Assembly>PipeSizer.1.3.0.dll</Assembly><AddInId>x</AddInId><FullClassName>PipeSizer.App</FullClassName><VendorId>PipeSizer</VendorId></AddIn></RevitAddIns>");
+File.WriteAllBytes(Path.Combine(tmpMan, "PipeSizer.1.3.0.dll"), new byte[] { 9 });
+Eq(PipeSizer.Updater.GetPendingUpdateVersion(tmpMan, "1.1.0"), "1.3.0", "updater pending manifest versioned dll");
+Eq(PipeSizer.Updater.GetPendingUpdateVersion(tmpMan, "1.3.0"), null, "updater pending manifest equals current");
+// Manifest points at a newer DLL but the file is missing -> ignored
+File.Delete(Path.Combine(tmpMan, "PipeSizer.1.3.0.dll"));
+Eq(PipeSizer.Updater.GetPendingUpdateVersion(tmpMan, "1.1.0"), null, "updater pending manifest missing file ignored");
+// No pending at all
+string tmpNone = Path.Combine(Path.GetTempPath(), "PipeSizer-pendnone-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(tmpNone);
+Eq(PipeSizer.Updater.GetPendingUpdateVersion(tmpNone, "1.1.0"), null, "updater pending none");
+Directory.Delete(tmpNone, true);
+Directory.Delete(tmpMan, true);
+// HTTP timeouts pinned: every updater HTTP call caps at 15 s, so a hung network
+// can never leave an on-demand check hanging forever.
+Eq(PipeSizer.Updater.ApiTimeout, TimeSpan.FromSeconds(15), "updater api timeout 15s");
+Eq(PipeSizer.Updater.DownloadTimeout, TimeSpan.FromSeconds(15), "updater download timeout 15s");
+Eq(PipeSizer.Updater.DialogText(PipeSizer.UpdateOutcome.Failed("Timed out after 60 seconds — check your network and try again.")), "Update check failed: Timed out after 60 seconds — check your network and try again.", "updater dialog timeout failure");
+Console.WriteLine("update hardening: PASS");
 Console.WriteLine("ALL TESTS PASSED");

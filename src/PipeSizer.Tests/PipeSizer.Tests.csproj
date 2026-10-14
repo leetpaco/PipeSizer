@@ -6,8 +6,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
-    <Version>1.1.3</Version>
-    <AssemblyVersion>1.1.3.0</AssemblyVersion>
+    <Version>1.2.0</Version>
+    <AssemblyVersion>1.2.0.0</AssemblyVersion>
   </PropertyGroup>
 
   <ItemGroup>
@@ -15,6 +15,10 @@
     <!-- Compile the real Updater.cs (BCL-only, no Revit/Sizing/WPF refs) directly
          into the test assembly, so updater logic is tested without loading Revit. -->
     <Compile Include="../PipeSizer/Updater.cs" Link="Updater.cs" />
+    <!-- Same pattern for the override logic: FlowOverrides.cs + Settings.cs (the
+         PipeCategory enum + settings) are BCL/Sizing-only, no Revit/WPF refs. -->
+    <Compile Include="../PipeSizer/FlowOverrides.cs" Link="FlowOverrides.cs" />
+    <Compile Include="../PipeSizer/Settings.cs" Link="Settings.cs" />
   </ItemGroup>
 
 </Project>

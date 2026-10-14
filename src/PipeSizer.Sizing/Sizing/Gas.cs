@@ -26,6 +26,9 @@ public static class GasSizing
 
     public static double CfhToPropaneMbh(double cfh) => cfh * PropaneBtuPerCubicFoot / 1000.0;
 
+    /// <summary>Inverse of <see cref="CfhToPropaneMbh"/>: MBH back to CFH (CFH = MBH × 1000 / 2500).</summary>
+    public static double PropaneMbhToCfh(double mbh) => mbh * 1000.0 / PropaneBtuPerCubicFoot;
+
     /// <summary>
     /// IFGC Table 402.4(2) as a GasTableDef, built from the existing GasTableData
     /// (Schedule 40 metallic, natural gas, inlet &lt; 2 psi, 0.5 in. w.c. drop, SG 0.60).

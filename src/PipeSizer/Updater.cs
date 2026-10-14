@@ -21,6 +21,12 @@ public sealed record UpdateOutcome(bool UpdateStaged, string? Version, string? N
     public static UpdateOutcome AlreadyCurrent(string version) =>
         new(false, version, $"PipeSizer is up to date (v{version}).", null);
 
+    /// <summary>An update is already downloaded and waiting for a restart (previous
+    /// on-demand check staged it, or the startup check downloaded it). Reuses
+    /// UpdateStaged=true so DialogText and the panel notice show the notice.</summary>
+    public static UpdateOutcome AlreadyStaged(string version) =>
+        new(true, version, $"Update v{version} already downloaded — restart Revit to apply.", null);
+
     public static UpdateOutcome Noop() => new(false, null, null, null);
 
     public static UpdateOutcome Failed(string error) =>
@@ -53,8 +59,10 @@ public static class Updater
     public const string StagingFolderName = "update-staging";
     public const string VersionFileName = "version.json";
 
-    private static readonly TimeSpan ApiTimeout = TimeSpan.FromSeconds(10);
-    private static readonly TimeSpan DownloadTimeout = TimeSpan.FromSeconds(60);
+    // Internal (not private) so the test harness — which compiles Updater.cs
+    // directly — can pin the timeout values.
+    internal static readonly TimeSpan ApiTimeout = TimeSpan.FromSeconds(15);
+    internal static readonly TimeSpan DownloadTimeout = TimeSpan.FromSeconds(15);
 
     // ----- Pure helpers (unit-tested) -----
 
@@ -231,7 +239,10 @@ public static class Updater
 
     /// <summary>On-demand check: download + verify + stage a newer release in
     /// update-staging/. Does NOT touch the manifest or the loaded Sizing DLL.
-    /// Returns Failed with a message on error (the caller shows it).</summary>
+    /// If an update is already downloaded (previous on-demand check staged it, or
+    /// the startup check downloaded it and rewrote the manifest), reports it
+    /// instead of re-downloading. Returns Failed with a message on error
+    /// (the caller shows it).</summary>
     public static UpdateOutcome CheckAndStageForRestart()
     {
         try
@@ -240,11 +251,24 @@ public static class Updater
             if (string.IsNullOrEmpty(folder))
                 return UpdateOutcome.Failed("Could not locate the Addins folder.");
 
+            string current = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0";
+
             var release = GetLatestReleaseAsync().GetAwaiter().GetResult();
             if (release is null)
-                return UpdateOutcome.Failed("Could not reach GitHub.");
+            {
+                // Offline: a pending update is still worth reporting.
+                string? pendingOffline = GetPendingUpdateVersion(folder, current);
+                return pendingOffline is not null
+                    ? UpdateOutcome.AlreadyStaged(pendingOffline)
+                    : UpdateOutcome.Failed("Could not reach GitHub.");
+            }
 
-            string current = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0";
+            // Already downloaded and at least as new as the latest release:
+            // report it, never re-download.
+            string? pending = GetPendingUpdateVersion(folder, current);
+            if (pending is not null && CompareVersions(pending, release.TagVersion) >= 0)
+                return UpdateOutcome.AlreadyStaged(pending);
+
             if (CompareVersions(release.TagVersion, current) <= 0)
                 return UpdateOutcome.AlreadyCurrent(ParseVersionFromTag(release.Tag) ?? current);
 
@@ -261,7 +285,55 @@ public static class Updater
         }
         catch (Exception ex)
         {
-            return UpdateOutcome.Failed(ex.Message);
+            return UpdateOutcome.Failed(ex.GetType().Name + ": " + ex.Message);
+        }
+    }
+
+    /// <summary>Version of an update that is already downloaded and waiting for a
+    /// restart, or null. Two sources: a valid (SHA-verified) bundle in
+    /// update-staging/ from a previous on-demand check, or the manifest already
+    /// pointing at a newer versioned DLL (the startup check downloaded it and
+    /// rewrote the manifest). Never throws; corrupt/partial staging is ignored.</summary>
+    public static string? GetPendingUpdateVersion(string folder, string currentVersion)
+    {
+        try
+        {
+            string? pending = null;
+            // (a) staging dir from a previous on-demand check.
+            string staging = Path.Combine(folder, StagingFolderName);
+            string versionJsonPath = Path.Combine(staging, VersionFileName);
+            if (File.Exists(versionJsonPath))
+            {
+                var manifest = ParseVersionJson(File.ReadAllText(versionJsonPath));
+                if (manifest is not null)
+                {
+                    string stagedMain = Path.Combine(staging, $"PipeSizer.{manifest.Version}.dll");
+                    string stagedSizing = Path.Combine(staging, SizingAssemblyFile);
+                    if (File.Exists(stagedMain) && File.Exists(stagedSizing)
+                        && VerifySha256(File.ReadAllBytes(stagedMain), manifest.MainSha256)
+                        && VerifySha256(File.ReadAllBytes(stagedSizing), manifest.SizingSha256)
+                        && CompareVersions(manifest.Version, currentVersion) > 0)
+                        pending = manifest.Version;
+                }
+            }
+            // (b) manifest already points at a newer versioned DLL (startup check).
+            string? manifestAssembly = ReadManifestAssembly(Path.Combine(folder, ManifestFile));
+            if (manifestAssembly is not null
+                && manifestAssembly.StartsWith("PipeSizer.", StringComparison.OrdinalIgnoreCase)
+                && manifestAssembly.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(manifestAssembly, MainAssemblyFile, StringComparison.OrdinalIgnoreCase))
+            {
+                string ver = manifestAssembly["PipeSizer.".Length..^".dll".Length];
+                if (ver.Length > 0 && CompareVersions(ver, currentVersion) > 0
+                    && File.Exists(Path.Combine(folder, manifestAssembly))
+                    && (pending is null || CompareVersions(ver, pending) > 0))
+                    pending = ver;
+            }
+            return pending;
+        }
+        catch
+        {
+            return null;
         }
     }
 

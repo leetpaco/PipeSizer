@@ -82,6 +82,22 @@ pane gets closed.
 - **Systems** lists every MEP system in the model and the category it is
   checked as. Click a system, then use the category dropdown to override it
   (e.g. mark a misnamed system as Gas). Overrides last for the session.
+- **Manual flow override** — click a result row to select a pipe, then type a
+  flow in the Manual flow override group and click **Apply**. The override
+  replaces Revit's computed flow for that pipe (units follow the pipe's
+  category: GPM for Hydronic/Domestic, CFH for natural gas, MBH for propane)
+  — including for pipes that show "No flow — skipped", which become
+  checkable. Overridden rows are marked with `*` on the Flow value and
+  `(manual flow)` in the Note. **Clear** removes the override and goes back
+  to Revit's flow. Overrides are session-only, never written to the model
+  (check-only). A pipe in an Ignored system can't take an override.
+- **Check for updates** (panel button or ribbon button) checks GitHub for a
+  newer release. The panel immediately shows "Checking for updates…", and
+  the check always ends with a TaskDialog: staged ("Update vX.Y.Z
+  downloaded — restart Revit to apply."), already downloaded, already
+  current, or failed with the reason. HTTP calls time out at 15 s and the
+  whole check is capped at 60 s, so it can never hang silently. The new
+  version loads after one Revit restart.
 - **Settings** — hydronic/domestic material, velocity + friction limits,
   gas design length, and gas fuel / pressure / material. Changing any setting
   re-checks immediately. Each setting has its own label under Hydronic /
@@ -158,7 +174,9 @@ classified as anything else (sanitary, vent, fire, …) are ignored.
 - No system-level residual-pressure check (use the web app for the critical run).
 - Category overrides and settings are session-only (not saved between Revit runs).
 - The checker reads Revit's computed pipe Flow: a system must be connected and
-  calculated or its pipes show as "No flow — skipped".
+  calculated or its pipes show as "No flow — skipped". A **manual flow
+  override** (see Usage) replaces Revit's flow for a pipe, including
+  no-flow pipes, for the session.
 - A pipe whose current size is not in the selected material's table shows an
   Info row ("cannot evaluate") instead of a pass/fail.
 - Gas tables NOT included (out of scope for the fuel/pressure/material matrix

@@ -32,6 +32,13 @@ public sealed class PipeSizerSettings
     /// <summary>Per-system category overrides (keyed by system name, case-insensitive).</summary>
     public Dictionary<string, PipeCategory> CategoryOverrides { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Manual flow overrides, session-only (keyed by ElementId value). Value is in the
+    /// category's native unit: GPM for Hydronic/Domestic, CFH for natural gas, MBH for
+    /// propane. Never written to the Revit model (check-only) and never persisted.
+    /// </summary>
+    public Dictionary<long, double> FlowOverrides { get; } = new();
+
     /// <summary>Water temperature for hydronic checks. Fixed at 180 F in v1 (no UI input).</summary>
     public const double HydronicWaterTempF = 180;
 }

@@ -30,9 +30,6 @@ public sealed class CheckResult
 /// </summary>
 public static class Checker
 {
-    public const double M3sToGpm = 15850.3; // Revit stores flow internally in m3/s
-    public const double M3sToCfh = 127132.8;
-
     public static CheckResult Check(Document doc, PipeSizerSettings settings)
     {
         var rows = new List<PipeRow>();
@@ -56,11 +53,16 @@ public static class Checker
             .WhereElementIsNotElementType()
             .ToElements();
 
+        // Live pipe ids, for opportunistically pruning stale manual-flow overrides
+        // (e.g. for pipes deleted since the override was entered).
+        var seenIds = new HashSet<long>();
+
         foreach (var el in pipes)
         {
             if (el is not Pipe pipe)
                 continue;
             nPipes++;
+            seenIds.Add(pipe.Id.Value);
 
             var mepSystem = pipe.MEPSystem;
             string sysName = mepSystem?.Name ?? "(no system)";
@@ -87,7 +89,15 @@ public static class Checker
             }
 
             double? flowM3s = GetParam(pipe, BuiltInParameter.RBS_PIPE_FLOW_PARAM);
-            if (flowM3s is null)
+            // Manual flow override (session-only, panel-entered): a valid override
+            // beats Revit's computed flow and rescues pipes Revit never calculated
+            // a flow for. An invalid stored value (shouldn't happen — the panel
+            // validates on Apply) falls through to Revit's flow.
+            bool hasOverride = settings.FlowOverrides.TryGetValue(pipe.Id.Value, out double overrideNative)
+                && overrideNative > 0 && double.IsFinite(overrideNative);
+            double? nativeFlow = FlowOverrides.Resolve(flowM3s, hasOverride ? overrideNative : null,
+                category, gasConfig);
+            if (nativeFlow is null)
             {
                 rows.Add(Info(pipe, sysName, category, "No Flow parameter — is this a pipe in a calculated system?"));
                 nInfo++;
@@ -101,12 +111,22 @@ public static class Checker
             {
                 case PipeCategory.Gas:
                 {
-                    double cfh = flowM3s.Value * M3sToCfh;
-                    if (cfh < 0.5)
+                    // nativeFlow is already in the table-native unit (CFH for natural
+                    // gas, MBH for propane). The no-flow threshold is on CFH, so a
+                    // propane load converts back for the check. An override bypasses
+                    // the threshold entirely — the user explicitly gave this pipe a flow.
+                    double load = nativeFlow!.Value;
+                    if (!hasOverride)
                     {
-                        rows.Add(Info(pipe, sysName, category, "No flow — skipped"));
-                        nNoFlow++;
-                        break;
+                        double cfh = gasConfig.Fuel == GasFuel.Propane
+                            ? GasSizing.PropaneMbhToCfh(load)
+                            : load;
+                        if (cfh < 0.5)
+                        {
+                            rows.Add(Info(pipe, sysName, category, "No flow — skipped"));
+                            nNoFlow++;
+                            break;
+                        }
                     }
                     if (gasTable is null)
                     {
@@ -117,8 +137,9 @@ public static class Checker
                     }
                     // Table-native load: CFH for natural gas, MBH for propane
                     // (propane: 2,500 Btu/ft3, see GasSizing.PropaneBtuPerCubicFoot).
+                    // `load` already holds it (Resolve converted Revit flow, or the
+                    // manual override supplied it directly).
                     string units = gasTable.Units;
-                    double load = gasConfig.Fuel == GasFuel.Propane ? GasSizing.CfhToPropaneMbh(cfh) : cfh;
                     string flowText = $"{load:0} {units}";
                     double designLength = settings.GasDesignLengthFt;
                     double maxSize = gasTable.Sizes[^1];
@@ -240,8 +261,11 @@ public static class Checker
                 }
                 case PipeCategory.Hydronic:
                 {
-                    double gpm = flowM3s.Value * M3sToGpm;
-                    if (gpm < 0.05)
+                    // nativeFlow is GPM (Resolve converted Revit flow, or the manual
+                    // override supplied it). An override bypasses the no-flow
+                    // threshold — the user explicitly gave this pipe a flow.
+                    double gpm = nativeFlow!.Value;
+                    if (!hasOverride && gpm < 0.05)
                     {
                         rows.Add(Info(pipe, sysName, category, "No flow — skipped"));
                         nNoFlow++;
@@ -292,8 +316,8 @@ public static class Checker
                 }
                 case PipeCategory.Domestic:
                 {
-                    double gpm = flowM3s.Value * M3sToGpm;
-                    if (gpm < 0.05)
+                    double gpm = nativeFlow!.Value;
+                    if (!hasOverride && gpm < 0.05)
                     {
                         rows.Add(Info(pipe, sysName, category, "No flow — skipped"));
                         nNoFlow++;
@@ -345,6 +369,26 @@ public static class Checker
             }
         }
 
+        // Rows that used a manual flow override get marked (Flow cell " *",
+        // Note gains "(manual flow)"), and overrides for pipes that no longer
+        // exist are pruned. Every row produced for an overridden pipe used the
+        // override (Resolve prefers it), so post-processing here is exact.
+        if (settings.FlowOverrides.Count > 0)
+        {
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var row = rows[i];
+                if (settings.FlowOverrides.TryGetValue(row.ElementIdValue, out double ov)
+                    && ov > 0 && double.IsFinite(ov))
+                    rows[i] = MarkManual(row);
+            }
+            foreach (var key in settings.FlowOverrides.Keys.ToList())
+            {
+                if (!seenIds.Contains(key))
+                    settings.FlowOverrides.Remove(key);
+            }
+        }
+
         string summary = $"{nPipes} pipes read · {nViolations} violation(s) · {nOversize} oversize · " +
                          $"{nNoFlow} no-flow · {nInfo} info · {nOk} OK · {nIgnored} ignored · {DateTime.Now:HH:mm:ss}";
         return new CheckResult
@@ -367,6 +411,23 @@ public static class Checker
             return null;
         }
     }
+
+    /// <summary>Copies a row, marking it as using a manual flow override.</summary>
+    private static PipeRow MarkManual(PipeRow row) => new()
+    {
+        ElementId = row.ElementId,
+        ElementIdValue = row.ElementIdValue,
+        System = row.System,
+        Category = row.Category,
+        Flow = row.Flow + " *",
+        CurrentSize = row.CurrentSize,
+        RequiredSize = row.RequiredSize,
+        Check = row.Check,
+        Actual = row.Actual,
+        Limit = row.Limit,
+        Status = row.Status,
+        Note = row.Note.Length > 0 ? row.Note + " (manual flow)" : "(manual flow)",
+    };
 
     private static PipeRow Info(Pipe pipe, string sysName, PipeCategory category, string note) => new()
     {

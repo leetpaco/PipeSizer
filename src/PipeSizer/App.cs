@@ -52,6 +52,11 @@ public class App : IExternalApplication
     /// <summary>Debounce: wait this long after the last model change before re-checking.</summary>
     private const double DebounceMs = 1500;
 
+    /// <summary>Overall cap on an on-demand update check: the TaskDialog always
+    /// appears by this time (the 15 s per-call HTTP timeouts in Updater normally
+    /// resolve it much sooner).</summary>
+    private static readonly TimeSpan OnDemandOverallTimeout = TimeSpan.FromSeconds(60);
+
     internal static PipeSizerPanel? Panel => _panel;
 
     private static readonly string StartupLogPath =
@@ -275,38 +280,132 @@ public class App : IExternalApplication
         }
     }
 
-    /// <summary>On-demand update check from the panel button. Runs off the UI thread;
-    /// stages (never applies in place) because Sizing is already loaded.</summary>
+    /// <summary>On-demand update check from the panel button / ribbon button.
+    /// Runs off the UI thread; stages (never applies in place) because Sizing is
+    /// already loaded. The outcome is ALWAYS surfaced: panel notice + TaskDialog,
+    /// with every step logged to %TEMP%\PipeSizer-startup.log — no catch block
+    /// here swallows an exception silently.
+    ///
+    /// Completion guarantee: the click shows "Checking for updates…" synchronously
+    /// (so the click visibly registers even if the background check then hangs),
+    /// the check is capped by a 60 s overall guard (on top of the 15 s per-call
+    /// HTTP timeouts), and the outcome is delivered via Dispatcher.BeginInvoke
+    /// (never blocks, so a stuck UI thread can't deadlock the background task).
+    /// No path ends with the panel still saying "Checking for updates…" forever.</summary>
     public static void CheckForUpdatesOnDemand()
     {
-        Task.Run(() =>
+        // IMMEDIATE FEEDBACK, synchronously on the calling (UI) thread, before any
+        // background work: the click visibly registers no matter what happens next.
+        try
+        {
+            Panel?.ShowUpdateNotice("Checking for updates…");
+            StartupLog("On-demand update check started.");
+        }
+        catch (Exception ex)
+        {
+            StartupLog("On-demand checking notice FAILED: " + ex.GetType().Name + ": " + ex.Message);
+        }
+        var panel = Panel;
+        // Fire-and-forget by design: the outcome is delivered via BeginInvoke +
+        // TaskDialog, and the 60 s guard caps the wait. Discard documents intent.
+        _ = Task.Run(async () =>
         {
             UpdateOutcome outcome;
             try
             {
-                outcome = Updater.CheckAndStageForRestart();
+                // The check itself runs on its own thread-pool thread so the guard
+                // below can abandon it on timeout (its result is then discarded;
+                // exactly one outcome is ever shown).
+                var checkTask = Task.Run(() =>
+                {
+                    try
+                    {
+                        return Updater.CheckAndStageForRestart();
+                    }
+                    catch (Exception ex)
+                    {
+                        return UpdateOutcome.Failed(ex.GetType().Name + ": " + ex.Message);
+                    }
+                });
+                var completed = await Task.WhenAny(checkTask, Task.Delay(OnDemandOverallTimeout))
+                    .ConfigureAwait(false);
+                if (completed == checkTask)
+                {
+                    outcome = await checkTask.ConfigureAwait(false);
+                }
+                else
+                {
+                    outcome = UpdateOutcome.Failed(
+                        "Timed out after 60 seconds — check your network and try again.");
+                    StartupLog("On-demand update check timed out after 60 s (background check abandoned).");
+                }
+                StartupLog("On-demand update check result: " + outcome);
             }
             catch (Exception ex)
             {
-                outcome = UpdateOutcome.Failed(ex.Message);
+                outcome = UpdateOutcome.Failed(ex.GetType().Name + ": " + ex.Message);
+                StartupLog("On-demand update check threw: " + ex.GetType().Name + ": " + ex.Message);
             }
-            try
+            // ALWAYS surface the outcome: panel notice + TaskDialog, delivered via
+            // BeginInvoke (queued, never blocking) so a stuck UI thread can't
+            // deadlock this background task.
+            string dialogText = Updater.DialogText(outcome);
+            if (panel is not null)
             {
-                Panel?.Dispatcher.Invoke(() =>
+                try
                 {
-                    Panel.ShowUpdateNotice(outcome.Notice ?? outcome.Error ?? "No update available.");
-                    // Same outcome as a TaskDialog, so the result is visible even
-                    // if the pane gets closed. OK button only — no restart button:
-                    // closing Revit programmatically risks unsaved work.
-                    try
+                    panel.Dispatcher.BeginInvoke(new Action(() =>
                     {
-                        TaskDialog.Show("PipeSizer Update", Updater.DialogText(outcome));
-                    }
-                    catch { /* panel notice already shown */ }
-                });
+                        try
+                        {
+                            panel.ShowUpdateNotice(outcome.Notice ?? outcome.Error ?? dialogText);
+                        }
+                        catch (Exception ex)
+                        {
+                            StartupLog("On-demand panel notice FAILED: " + ex.GetType().Name + ": " + ex.Message);
+                        }
+                        // Same outcome as a TaskDialog, so the result is visible even
+                        // if the pane gets closed. OK button only — no restart button:
+                        // closing Revit programmatically risks unsaved work.
+                        try
+                        {
+                            TaskDialog.Show("PipeSizer Update", dialogText);
+                            StartupLog("On-demand update dialog shown: " + dialogText);
+                        }
+                        catch (Exception ex)
+                        {
+                            StartupLog("On-demand update dialog FAILED: " + ex.GetType().Name + ": " + ex.Message);
+                        }
+                    }));
+                    StartupLog("On-demand update outcome queued to UI thread: " + dialogText);
+                }
+                catch (Exception ex)
+                {
+                    StartupLog("On-demand BeginInvoke FAILED: " + ex.GetType().Name + ": " + ex.Message);
+                    ShowUpdateDialogFallback(dialogText);
+                }
             }
-            catch { /* panel gone */ }
+            else
+            {
+                StartupLog("On-demand update: panel is null, attempting dialog directly.");
+                ShowUpdateDialogFallback(dialogText);
+            }
         });
+    }
+
+    /// <summary>Last-resort TaskDialog when the panel/dispatcher path is unavailable.
+    /// May throw off the UI thread; the caller logs the failure.</summary>
+    private static void ShowUpdateDialogFallback(string dialogText)
+    {
+        try
+        {
+            TaskDialog.Show("PipeSizer Update", dialogText);
+            StartupLog("On-demand update dialog shown (fallback): " + dialogText);
+        }
+        catch (Exception ex)
+        {
+            StartupLog("On-demand fallback dialog FAILED: " + ex.GetType().Name + ": " + ex.Message);
+        }
     }
 
     /// <summary>

@@ -44,6 +44,12 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
     private CheckBox _pauseLive = null!;
     private ListBox _systemsList = null!;
     private ComboBox _systemCategory = null!;
+    private TextBlock _overrideLabel = null!;
+    private TextBox _overrideBox = null!;
+    private TextBlock _overrideUnit = null!;
+    private Button _overrideApply = null!;
+    private Button _overrideClear = null!;
+    private PipeRow? _selectedRow;
     private DataGrid _grid = null!;
     private TextBlock _status = null!;
     private TextBlock _updateNotice = null!;
@@ -90,6 +96,23 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
                 else if (_settings.ShowAll)
                     _rows.Add(row);
             }
+            // Restore the selected row across the rebuild (by ElementId), so the
+            // manual-flow group keeps tracking the same pipe after a re-check.
+            // The pipe may have dropped out of the list (deleted, or now OK with
+            // Show-all off) — then selection clears.
+            if (_selectedRow is not null)
+            {
+                var restored = _rows.FirstOrDefault(r => r.ElementIdValue == _selectedRow.ElementIdValue);
+                if (restored is not null)
+                {
+                    _selectedRow = restored;
+                    _grid.SelectedItem = restored;
+                }
+                else
+                {
+                    _selectedRow = null;
+                }
+            }
             _updatingGrid = false;
 
             _updatingSystemsList = true;
@@ -110,6 +133,7 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
             }
             _updatingSystemsList = false;
             RefreshCategoryCombo();
+            RefreshOverrideGroup();
             _status.Text = result.Summary;
         });
     }
@@ -299,6 +323,35 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
         _systemCategory.SelectionChanged += OnCategoryChanged;
         stack.Children.Add(Labeled("Category for selected system", _systemCategory));
 
+        // --- Manual flow override ---
+        // Separate control group, NOT an editable Flow column: single-click on a
+        // row selects, double-click zooms, so in-grid editing would conflict.
+        // The user types a flow for the selected pipe instead of relying on
+        // Revit's computed flow. Session-only, never written to the model.
+        stack.Children.Add(SectionTitle("Manual flow override"));
+        _overrideLabel = new TextBlock { Text = "Click a result row to select a pipe", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 4) };
+        stack.Children.Add(_overrideLabel);
+        _overrideBox = new TextBox { Margin = new Thickness(0, 0, 4, 0), IsEnabled = false, Width = 90 };
+        _overrideBox.KeyDown += (_, e) =>
+        {
+            if (e.Key == System.Windows.Input.Key.Enter)
+            {
+                ApplyOverride();
+                e.Handled = true;
+            }
+        };
+        _overrideUnit = new TextBlock { Text = "GPM", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) };
+        _overrideApply = new Button { Content = "Apply", Padding = new Thickness(12, 4, 12, 4), Margin = new Thickness(0, 0, 4, 0), IsEnabled = false };
+        _overrideApply.Click += (_, _) => ApplyOverride();
+        _overrideClear = new Button { Content = "Clear", Padding = new Thickness(12, 4, 12, 4), IsEnabled = false };
+        _overrideClear.Click += (_, _) => ClearOverride();
+        var overrideRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 4) };
+        overrideRow.Children.Add(_overrideBox);
+        overrideRow.Children.Add(_overrideUnit);
+        overrideRow.Children.Add(_overrideApply);
+        overrideRow.Children.Add(_overrideClear);
+        stack.Children.Add(overrideRow);
+
         // --- Results (own row: bounded height, so the grid can virtualize) ---
         var resultsPanel = new DockPanel();
         WpfGrid.SetRow(resultsPanel, 1);
@@ -448,6 +501,74 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
         if (_updatingGrid)
             return;
         if (_grid.SelectedItem is PipeRow row)
+        {
+            _selectedRow = row;
+            RefreshOverrideGroup();
             App.RequestSelect(row.ElementId, zoom: false);
+        }
+        else
+        {
+            _selectedRow = null;
+            RefreshOverrideGroup();
+        }
+    }
+
+    /// <summary>Syncs the manual-flow group with the selected row (label, unit, pre-filled value, enabled state).</summary>
+    private void RefreshOverrideGroup()
+    {
+        if (_selectedRow is null)
+        {
+            _overrideLabel.Text = "Click a result row to select a pipe";
+            _overrideBox.Text = "";
+            _overrideBox.IsEnabled = false;
+            _overrideUnit.Text = "GPM";
+            _overrideApply.IsEnabled = false;
+            _overrideClear.IsEnabled = false;
+            return;
+        }
+        _overrideLabel.Text = $"Selected pipe: {_selectedRow.ElementIdValue} ({_selectedRow.System}, {_selectedRow.Category})";
+        Enum.TryParse<PipeCategory>(_selectedRow.Category, out var cat);
+        _overrideUnit.Text = FlowOverrides.UnitLabel(cat, _settings.GasFuel);
+        _overrideBox.IsEnabled = true;
+        _overrideApply.IsEnabled = true;
+        _overrideClear.IsEnabled = true;
+        // Pre-fill an existing override for this pipe (blank = Revit's flow).
+        _overrideBox.Text = _settings.FlowOverrides.TryGetValue(_selectedRow.ElementIdValue, out double existing)
+            ? existing.ToString("0.##")
+            : "";
+    }
+
+    /// <summary>Validates and stores a manual flow for the selected pipe, then re-checks.</summary>
+    private void ApplyOverride()
+    {
+        if (_selectedRow is null)
+            return;
+        Enum.TryParse<PipeCategory>(_selectedRow.Category, out var cat);
+        if (cat == PipeCategory.Ignore)
+        {
+            _status.Text = "Pipe is in an Ignored system — manual flow not applied.";
+            return;
+        }
+        if (!FlowOverrides.TryParseFlow(_overrideBox.Text, out double value))
+        {
+            _status.Text = "Invalid flow — enter a positive number.";
+            return;
+        }
+        _settings.FlowOverrides[_selectedRow.ElementIdValue] = value;
+        _status.Text = $"Manual flow {value:0.##} {FlowOverrides.UnitLabel(cat, _settings.GasFuel)} applied to pipe {_selectedRow.ElementIdValue}.";
+        App.RequestCheck();
+    }
+
+    /// <summary>Removes the manual flow for the selected pipe (if any), then re-checks.</summary>
+    private void ClearOverride()
+    {
+        if (_selectedRow is null)
+            return;
+        if (_settings.FlowOverrides.Remove(_selectedRow.ElementIdValue))
+            _status.Text = $"Manual flow cleared for pipe {_selectedRow.ElementIdValue} — back to Revit's flow.";
+        else
+            _status.Text = "No manual flow set for this pipe.";
+        _overrideBox.Text = "";
+        App.RequestCheck();
     }
 }
