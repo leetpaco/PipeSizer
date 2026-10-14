@@ -4,6 +4,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Data;
+using System.Windows.Media;
 using Autodesk.Revit.DB;
 using Autodesk.Revit.UI;
 using PipeSizer.Sizing;
@@ -57,6 +58,14 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
     public PipeSizerPanel()
     {
         MinWidth = 340;
+        // Explicit light theme: Revit's dark-themed dockable-pane host gives a
+        // dark background, and WPF TextBlocks default to black text — black on
+        // black made every label invisible (controls with their own white
+        // backgrounds, like ComboBox/TextBox/DataGrid headers, still showed).
+        // Forcing white background + black foreground makes all text readable
+        // regardless of Revit's theme.
+        Background = Brushes.White;
+        Foreground = Brushes.Black;
         BuildUi();
         Loaded += (_, _) => App.RequestCheck();
     }
@@ -124,7 +133,7 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
 
     private void BuildUi()
     {
-        var root = new DockPanel { Margin = new Thickness(6) };
+        var root = new DockPanel { Margin = new Thickness(6), Background = Brushes.White };
 
         var header = new TextBlock
         {
@@ -133,12 +142,13 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
             Text = $"PipeSizer — v{Updater.DisplayVersion(Assembly.GetExecutingAssembly().GetName().Version)} — live pipe sizing check",
             FontWeight = FontWeights.Bold,
             FontSize = 13,
+            Foreground = Brushes.Black,
             Margin = new Thickness(0, 0, 0, 6),
         };
         DockPanel.SetDock(header, Dock.Top);
         root.Children.Add(header);
 
-        _status = new TextBlock { Text = "Press Refresh to check.", Margin = new Thickness(0, 6, 0, 0), TextWrapping = TextWrapping.Wrap };
+        _status = new TextBlock { Text = "Press Refresh to check.", Foreground = Brushes.Black, Margin = new Thickness(0, 6, 0, 0), TextWrapping = TextWrapping.Wrap };
         DockPanel.SetDock(_status, Dock.Bottom);
         root.Children.Add(_status);
 
@@ -147,6 +157,7 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
             Text = "",
             Visibility = System.Windows.Visibility.Collapsed,
             FontWeight = FontWeights.SemiBold,
+            Foreground = Brushes.Black,
             Margin = new Thickness(0, 6, 0, 0),
             TextWrapping = TextWrapping.Wrap,
         };
@@ -171,6 +182,7 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
         // --- Settings ---
         stack.Children.Add(SectionTitle("Settings"));
 
+        stack.Children.Add(SectionTitle("Hydronic"));
         _hydronicMaterial = new ComboBox { ItemsSource = Materials.Names.ToList(), SelectedItem = _settings.HydronicMaterial, Margin = new Thickness(0, 0, 0, 4) };
         _hydronicMaterial.SelectionChanged += (_, _) =>
         {
@@ -183,6 +195,7 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
         _hydronicHmax = NumberBox(_settings.HydronicMaxFrictionPer100Ft, v => _settings.HydronicMaxFrictionPer100Ft = v);
         stack.Children.Add(Labeled("Hydronic max friction (ft/100 ft)", _hydronicHmax));
 
+        stack.Children.Add(SectionTitle("Domestic"));
         _domesticMaterial = new ComboBox { ItemsSource = Materials.Names.ToList(), SelectedItem = _settings.DomesticMaterial, Margin = new Thickness(0, 0, 0, 4) };
         _domesticMaterial.SelectionChanged += (_, _) =>
         {
@@ -195,6 +208,7 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
         _domesticHmax = NumberBox(_settings.DomesticMaxFrictionPer100Ft, v => _settings.DomesticMaxFrictionPer100Ft = v);
         stack.Children.Add(Labeled("Domestic max friction (ft/100 ft)", _domesticHmax));
 
+        stack.Children.Add(SectionTitle("Gas"));
         _gasLength = NumberBox(_settings.GasDesignLengthFt, v => _settings.GasDesignLengthFt = v);
         stack.Children.Add(Labeled("Gas design length (ft)", _gasLength));
 
@@ -332,13 +346,14 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
     {
         Text = text,
         FontWeight = FontWeights.SemiBold,
+        Foreground = Brushes.Black,
         Margin = new Thickness(0, 6, 0, 4),
     };
 
     private static StackPanel Labeled(string label, Control control)
     {
         var p = new StackPanel { Margin = new Thickness(0, 0, 0, 2) };
-        p.Children.Add(new TextBlock { Text = label });
+        p.Children.Add(new TextBlock { Text = label, Foreground = Brushes.Black });
         p.Children.Add(control);
         return p;
     }

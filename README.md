@@ -84,7 +84,10 @@ pane gets closed.
   (e.g. mark a misnamed system as Gas). Overrides last for the session.
 - **Settings** — hydronic/domestic material, velocity + friction limits,
   gas design length, and gas fuel / pressure / material. Changing any setting
-  re-checks immediately.
+  re-checks immediately. Each setting has its own label under Hydronic /
+  Domestic / Gas section headers. The panel uses an explicit light theme
+  (white background, black text) so labels stay readable when Revit is set
+  to its dark theme.
 
 ## Methods (same as the Dynamo graphs / web app)
 
