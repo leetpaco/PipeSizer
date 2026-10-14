@@ -18,7 +18,12 @@ Source: https://github.com/leetpaco/PipeSizer — updates are automatic (see
    (typically `C:\Users\<you>\AppData\Roaming\Autodesk\Revit\Addins\2025\`)
 2. Restart Revit.
 3. Open the pane with the **PipeSizer** ribbon tab → **Pipe Sizer** button.
-   (The pane docks on the right; drag it wherever you like.)
+   (The pane docks on the right; drag it wherever you like.) The ribbon also
+   has a **Check for Updates** button that runs the update check without
+   closing Revit — the new version still only loads after a restart.
+   If the ribbon button ever fails to appear, the pane opens automatically
+   on startup and the reason is shown in the panel notice; startup details
+   are logged to `%TEMP%\PipeSizer-startup.log`.
 
 ## Auto-update
 

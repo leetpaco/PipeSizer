@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.IO;
 using System.Reflection;
 using Autodesk.Revit.Attributes;
 using Autodesk.Revit.DB;
@@ -36,6 +38,9 @@ public class App : IExternalApplication
     private static bool _paused;
     private static ElementId? _pendingSelect;
     private static bool _pendingSelectZoom;
+    private static bool _autoShowPanePending;
+    private static bool _autoShowRequested;
+    private static bool _autoShow;
     private static readonly HashSet<ElementId> _changedAdded = new();
     private static readonly HashSet<ElementId> _changedModified = new();
     private static readonly HashSet<ElementId> _changedDeleted = new();
@@ -45,8 +50,25 @@ public class App : IExternalApplication
 
     internal static PipeSizerPanel? Panel => _panel;
 
+    private static readonly string StartupLogPath =
+        Path.Combine(Path.GetTempPath(), "PipeSizer-startup.log");
+
+    /// <summary>Appends one line to the startup log. Never throws, never blocks startup.</summary>
+    private static void StartupLog(string message)
+    {
+        try
+        {
+            File.AppendAllText(StartupLogPath,
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture)
+                + " " + message + Environment.NewLine);
+        }
+        catch { /* logging must never break startup */ }
+    }
+
     public Result OnStartup(UIControlledApplication app)
     {
+        StartupLog("OnStartup begin (v" + Assembly.GetExecutingAssembly().GetName().Version + ")");
+
         // Auto-update check runs FIRST, before any Sizing type is touched: the
         // updater may overwrite PipeSizer.Sizing.dll, which is only safe while
         // it is not yet loaded. Never let the check block startup.
@@ -55,18 +77,37 @@ public class App : IExternalApplication
         {
             var outcome = Updater.RunStartupUpdate();
             updateNotice = outcome.Notice;
+            StartupLog("Updater: " + (outcome.Notice ?? outcome.Error ?? "no update"));
         }
-        catch { /* never block startup on update */ }
+        catch (Exception ex)
+        {
+            StartupLog("Updater FAILED: " + ex.GetType().Name + ": " + ex.Message);
+        }
 
         _panel = new PipeSizerPanel();
         if (updateNotice is not null)
             _panel.ShowUpdateNotice(updateNotice);
         app.RegisterDockablePane(PaneId, "PipeSizer", _panel);
+        StartupLog("Dockable pane registered.");
 
-        // Ribbon button is convenience only: if it fails (e.g. a panel-name
-        // collision), the add-in still loads and the pane still registers.
+        // Ribbon button: created explicitly, step by step, with every failure
+        // captured. v1.1.0 wrapped this in a silent catch-all, so when
+        // CreateRibbonPanel threw (no tab existed yet) the button was never
+        // created and the pane had no way to open — with nothing logged.
+        bool ribbonOk = false;
+        string? ribbonError = null;
         try
         {
+            try
+            {
+                app.CreateRibbonTab("PipeSizer");
+                StartupLog("Ribbon tab created.");
+            }
+            catch (Exception ex)
+            {
+                // Tab already exists (e.g. a second PipeSizer copy) — proceed to the panel.
+                StartupLog("CreateRibbonTab threw (proceeding): " + ex.GetType().Name + ": " + ex.Message);
+            }
             var ribbon = app.CreateRibbonPanel("PipeSizer", "PipeSizer");
             var buttonData = new PushButtonData(
                 "ShowPipeSizer",
@@ -74,15 +115,39 @@ public class App : IExternalApplication
                 Assembly.GetExecutingAssembly().Location,
                 typeof(ShowPaneCommand).FullName!);
             ribbon.AddItem(buttonData);
+            var updateButtonData = new PushButtonData(
+                "CheckForUpdates",
+                "Check for\nUpdates",
+                Assembly.GetExecutingAssembly().Location,
+                typeof(CheckForUpdatesCommand).FullName!);
+            ribbon.AddItem(updateButtonData);
+            ribbonOk = true;
+            StartupLog("Ribbon panel + buttons created OK.");
         }
-        catch
+        catch (Exception ex)
         {
-            // Pane remains usable via Revit's dockable-pane handling.
+            ribbonError = ex.GetType().Name + ": " + ex.Message;
+            StartupLog("Ribbon creation FAILED: " + ribbonError);
+        }
+
+        if (!ribbonOk)
+        {
+            // Fallback: auto-show the pane on the first Idling run so the
+            // add-in stays usable without the button. Normal path (button
+            // created) never auto-shows.
+            lock (Sync) { _autoShowPanePending = true; }
+            var ribbonMsg = "Ribbon button could not be created (" + ribbonError
+                + "). The panel opened automatically; details in %TEMP%\\PipeSizer-startup.log.";
+            _panel.ShowUpdateNotice(updateNotice is not null
+                ? updateNotice + "\n" + ribbonMsg
+                : ribbonMsg);
+            StartupLog("Fallback: pane will auto-show on first Idling run.");
         }
 
         _checkEvent = ExternalEvent.Create(new CheckEventHandler());
         app.ControlledApplication.DocumentChanged += OnDocumentChanged;
         app.Idling += OnIdling;
+        StartupLog("OnStartup complete.");
         return Result.Succeeded;
     }
 
@@ -119,6 +184,14 @@ public class App : IExternalApplication
         {
             if (_checkRunning)
                 return; // a check is already executing; Idling will fire again after it
+            // Ribbon-fallback: first Idling run after a failed ribbon creation
+            // auto-shows the pane (consumed once; hiding it afterwards sticks).
+            if (_autoShowPanePending && !_autoShowRequested)
+            {
+                _autoShowRequested = true;
+                _autoShow = true;
+                raise = true;
+            }
             if (_pendingSelect is not null)
             {
                 raise = true; // retry a select whose first raise never executed
@@ -207,7 +280,8 @@ public class App : IExternalApplication
     /// Also marks a check as running; <see cref="EndCheck"/> clears it.
     /// </summary>
     internal static (bool ManualCheck, bool AutoCheck, ElementId? SelectId, bool SelectZoom,
-        HashSet<ElementId> Added, HashSet<ElementId> Modified, HashSet<ElementId> Deleted) TakeWork()
+        HashSet<ElementId> Added, HashSet<ElementId> Modified, HashSet<ElementId> Deleted,
+        bool AutoShow) TakeWork()
     {
         lock (Sync)
         {
@@ -215,6 +289,7 @@ public class App : IExternalApplication
             bool auto = _autoCheckPending;
             var selectId = _pendingSelect;
             bool zoom = _pendingSelectZoom;
+            bool autoShow = _autoShow;
             HashSet<ElementId> added, modified, deleted;
             if (auto)
             {
@@ -235,8 +310,9 @@ public class App : IExternalApplication
             _autoCheckPending = false;
             _pendingSelect = null;
             _pendingSelectZoom = false;
+            _autoShow = false;
             _checkRunning = true;
-            return (manual, auto, selectId, zoom, added, modified, deleted);
+            return (manual, auto, selectId, zoom, added, modified, deleted, autoShow);
         }
     }
 
@@ -253,8 +329,23 @@ public class CheckEventHandler : IExternalEventHandler
     {
         try
         {
-            var (manual, auto, selectId, selectZoom, added, modified, deleted) = App.TakeWork();
+            var (manual, auto, selectId, selectZoom, added, modified, deleted, autoShow) = App.TakeWork();
             var uidoc = app.ActiveUIDocument;
+
+            // Ribbon-fallback: ribbon creation failed at startup, so show the
+            // pane once (consumed in TakeWork; hiding it afterwards sticks).
+            // Runs regardless of whether a document is open.
+            if (autoShow)
+            {
+                try
+                {
+                    app.GetDockablePane(App.PaneId).Show();
+                }
+                catch (Exception ex)
+                {
+                    App.Panel?.ShowError("Could not show pane: " + ex.Message);
+                }
+            }
 
             if (selectId is not null && uidoc is not null)
             {
@@ -346,6 +437,32 @@ public class ShowPaneCommand : IExternalCommand
             pane.Hide();
         else
             pane.Show();
+        return Result.Succeeded;
+    }
+}
+
+/// <summary>
+/// Ribbon button: opens the pane and runs the on-demand update check via the
+/// existing App.CheckForUpdatesOnDemand path (background thread, outcome shown
+/// in the panel). The check stages the new version, but it only loads after a
+/// Revit restart — Revit cannot swap a loaded add-in — and the panel notice
+/// says exactly that.
+/// </summary>
+[Transaction(TransactionMode.Manual)]
+[Regeneration(RegenerationOption.Manual)]
+public class CheckForUpdatesCommand : IExternalCommand
+{
+    public Result Execute(ExternalCommandData commandData, ref string message, ElementSet elements)
+    {
+        try
+        {
+            commandData.Application.GetDockablePane(App.PaneId).Show();
+        }
+        catch
+        {
+            // Pane may already be shown or unavailable; the check still runs.
+        }
+        App.CheckForUpdatesOnDemand();
         return Result.Succeeded;
     }
 }
