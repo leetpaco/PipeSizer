@@ -234,7 +234,7 @@ Eq(PipeSizer.Updater.DisplayVersion(new Version(1, 1, 2, 3)), "1.1.2.3", "update
 Eq(PipeSizer.Updater.DisplayVersion(new Version(2, 0, 0, 0)), "2.0.0", "updater display version 2.0.0");
 Eq(PipeSizer.Updater.DisplayVersion(null), "unknown", "updater display version null");
 
-Eq(PipeSizer.Updater.DialogText(PipeSizer.UpdateOutcome.Staged("1.1.2")), "Update v1.1.2 downloaded — restart Revit to apply.", "updater dialog staged");
+Eq(PipeSizer.Updater.DialogText(PipeSizer.UpdateOutcome.Staged("1.1.2")), "Update v1.1.2 downloaded — restart Revit twice to apply.", "updater dialog staged");
 Eq(PipeSizer.Updater.DialogText(PipeSizer.UpdateOutcome.AlreadyCurrent("1.1.1")), "You're on the latest version (v1.1.1).", "updater dialog already current");
 Eq(PipeSizer.Updater.DialogText(PipeSizer.UpdateOutcome.Failed("boom")), "Update check failed: boom", "updater dialog failed");
 Eq(PipeSizer.Updater.DialogText(PipeSizer.UpdateOutcome.Noop()), "No update available.", "updater dialog noop");
@@ -335,8 +335,8 @@ Console.WriteLine("updater: PASS");
 // --- On-demand update hardening: AlreadyStaged + pending-update detection ---
 var alreadyStaged = PipeSizer.UpdateOutcome.AlreadyStaged("1.2.0");
 Check(alreadyStaged.UpdateStaged, "updater already-staged flag");
-Eq(alreadyStaged.Notice, "Update v1.2.0 already downloaded — restart Revit to apply.", "updater already-staged notice");
-Eq(PipeSizer.Updater.DialogText(alreadyStaged), "Update v1.2.0 already downloaded — restart Revit to apply.", "updater dialog already-staged");
+Eq(alreadyStaged.Notice, "Update v1.2.0 already downloaded — restart Revit twice to apply.", "updater already-staged notice");
+Eq(PipeSizer.Updater.DialogText(alreadyStaged), "Update v1.2.0 already downloaded — restart Revit twice to apply.", "updater dialog already-staged");
 
 // GetPendingUpdateVersion: valid staged bundle in update-staging/
 string tmpPend = Path.Combine(Path.GetTempPath(), "PipeSizer-pend-" + Guid.NewGuid().ToString("N"));
@@ -382,4 +382,75 @@ Eq(PipeSizer.Updater.ApiTimeout, TimeSpan.FromSeconds(15), "updater api timeout 
 Eq(PipeSizer.Updater.DownloadTimeout, TimeSpan.FromSeconds(15), "updater download timeout 15s");
 Eq(PipeSizer.Updater.DialogText(PipeSizer.UpdateOutcome.Failed("Timed out after 60 seconds — check your network and try again.")), "Update check failed: Timed out after 60 seconds — check your network and try again.", "updater dialog timeout failure");
 Console.WriteLine("update hardening: PASS");
+// --- v1.2.1: one-restart updates — Applied vs Staged outcomes ---
+var appliedOutcome = PipeSizer.UpdateOutcome.Applied("1.2.1");
+Check(appliedOutcome.UpdateStaged, "updater applied flag");
+Eq(appliedOutcome.Notice, "Update v1.2.1 ready — restart Revit once to apply.", "updater applied notice");
+Eq(PipeSizer.Updater.DialogText(appliedOutcome), "Update v1.2.1 ready — restart Revit once to apply.", "updater dialog applied");
+var alreadyApplied = PipeSizer.UpdateOutcome.AlreadyApplied("1.2.1");
+Eq(alreadyApplied.Notice, "Update v1.2.1 already ready — restart Revit once to apply.", "updater already-applied notice");
+Eq(PipeSizer.Updater.DialogText(alreadyApplied), "Update v1.2.1 already ready — restart Revit once to apply.", "updater dialog already-applied");
+Console.WriteLine("update applied outcomes: PASS");
+
+// --- v1.2.1: GetPendingUpdate distinguishes fully-applied from staged-only ---
+string tmpPend2 = Path.Combine(Path.GetTempPath(), "PipeSizer-pend2-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(tmpPend2);
+string pend2Staging = Path.Combine(tmpPend2, "update-staging");
+Directory.CreateDirectory(pend2Staging);
+byte[] pend2Main = System.Text.Encoding.UTF8.GetBytes("pending-main-1.2.0");
+byte[] pend2Sizing = System.Text.Encoding.UTF8.GetBytes("pending-sizing-1.2.0");
+string pend2MainSha = PipeSizer.Updater.ComputeSha256Hex(pend2Main);
+string pend2SizingSha = PipeSizer.Updater.ComputeSha256Hex(pend2Sizing);
+File.WriteAllText(Path.Combine(pend2Staging, "version.json"),
+    $"{{\"version\": \"1.2.0\", \"assets\": {{\"PipeSizer.dll\": {{\"url\": \"\", \"sha256\": \"{pend2MainSha}\"}}, \"PipeSizer.Sizing.dll\": {{\"url\": \"\", \"sha256\": \"{pend2SizingSha}\"}}}}}}");
+File.WriteAllBytes(Path.Combine(pend2Staging, "PipeSizer.1.2.0.dll"), pend2Main);
+File.WriteAllBytes(Path.Combine(pend2Staging, "PipeSizer.Sizing.dll"), pend2Sizing);
+File.WriteAllText(Path.Combine(tmpPend2, "PipeSizer.addin"),
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><RevitAddIns><AddIn Type=\"Application\"><Name>PipeSizer</Name><Assembly>PipeSizer.dll</Assembly><AddInId>x</AddInId><FullClassName>PipeSizer.App</FullClassName><VendorId>PipeSizer</VendorId></AddIn></RevitAddIns>");
+// Staged-only: version + FullyApplied=false
+var pendOnlyStaged = PipeSizer.Updater.GetPendingUpdate(tmpPend2, "1.1.0");
+Eq(pendOnlyStaged.Version, "1.2.0", "updater pending staged-only version");
+Check(!pendOnlyStaged.FullyApplied, "updater pending staged-only not applied");
+Eq(PipeSizer.Updater.GetPendingUpdateVersion(tmpPend2, "1.1.0"), "1.2.0", "updater pending version wrapper");
+// Manifest points at a NEWER versioned DLL (fully applied) -> applied wins
+File.WriteAllText(Path.Combine(tmpPend2, "PipeSizer.addin"),
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><RevitAddIns><AddIn Type=\"Application\"><Name>PipeSizer</Name><Assembly>PipeSizer.1.3.0.dll</Assembly><AddInId>x</AddInId><FullClassName>PipeSizer.App</FullClassName><VendorId>PipeSizer</VendorId></AddIn></RevitAddIns>");
+File.WriteAllBytes(Path.Combine(tmpPend2, "PipeSizer.1.3.0.dll"), new byte[] { 7 });
+var pendAppliedWins = PipeSizer.Updater.GetPendingUpdate(tmpPend2, "1.1.0");
+Eq(pendAppliedWins.Version, "1.3.0", "updater pending applied-newer wins");
+Check(pendAppliedWins.FullyApplied, "updater pending applied-newer fully applied");
+// Staged bundle NEWER than manifest -> staged wins, not applied
+File.WriteAllText(Path.Combine(tmpPend2, "PipeSizer.addin"),
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><RevitAddIns><AddIn Type=\"Application\"><Name>PipeSizer</Name><Assembly>PipeSizer.1.1.5.dll</Assembly><AddInId>x</AddInId><FullClassName>PipeSizer.App</FullClassName><VendorId>PipeSizer</VendorId></AddIn></RevitAddIns>");
+File.WriteAllBytes(Path.Combine(tmpPend2, "PipeSizer.1.1.5.dll"), new byte[] { 8 });
+var pendStagedWins = PipeSizer.Updater.GetPendingUpdate(tmpPend2, "1.1.0");
+Eq(pendStagedWins.Version, "1.2.0", "updater pending staged-newer wins");
+Check(!pendStagedWins.FullyApplied, "updater pending staged-newer not applied");
+// Tie: manifest version == staged version -> applied wins (strictly better state)
+File.WriteAllText(Path.Combine(tmpPend2, "PipeSizer.addin"),
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><RevitAddIns><AddIn Type=\"Application\"><Name>PipeSizer</Name><Assembly>PipeSizer.1.2.0.dll</Assembly><AddInId>x</AddInId><FullClassName>PipeSizer.App</FullClassName><VendorId>PipeSizer</VendorId></AddIn></RevitAddIns>");
+File.WriteAllBytes(Path.Combine(tmpPend2, "PipeSizer.1.2.0.dll"), new byte[] { 9 });
+var pendTie = PipeSizer.Updater.GetPendingUpdate(tmpPend2, "1.1.0");
+Eq(pendTie.Version, "1.2.0", "updater pending tie version");
+Check(pendTie.FullyApplied, "updater pending tie applied wins");
+Directory.Delete(tmpPend2, true);
+Console.WriteLine("update pending state: PASS");
+
+// --- v1.2.1: auto-check interval gating + notify dedup (pure) ---
+var interval = PipeSizer.Updater.AutoCheckInterval;
+Eq(interval, TimeSpan.FromMinutes(30), "updater auto-check interval 30m");
+var t0 = new DateTimeOffset(2026, 10, 14, 12, 0, 0, TimeSpan.Zero);
+Check(PipeSizer.Updater.IsAutoCheckDue(t0, t0.AddMinutes(31), interval), "updater auto-check due after interval");
+Check(!PipeSizer.Updater.IsAutoCheckDue(t0, t0.AddMinutes(29), interval), "updater auto-check not due before interval");
+Check(PipeSizer.Updater.IsAutoCheckDue(t0, t0.AddMinutes(30), interval), "updater auto-check due exactly at interval");
+Check(!PipeSizer.Updater.IsAutoCheckDue(t0, t0.AddMinutes(-5), interval), "updater auto-check not due when last-check in future");
+Check(!PipeSizer.Updater.IsAutoCheckDue(t0, t0, interval), "updater auto-check not due at zero elapsed");
+var notified = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+Check(PipeSizer.Updater.ShouldNotifyForVersion(notified, "1.2.1"), "updater notify first time");
+Check(!PipeSizer.Updater.ShouldNotifyForVersion(notified, "1.2.1"), "updater notify dedup same version");
+Check(PipeSizer.Updater.ShouldNotifyForVersion(notified, "1.2.2"), "updater notify different version independent");
+Check(!PipeSizer.Updater.ShouldNotifyForVersion(notified, null), "updater notify null never");
+Check(!PipeSizer.Updater.ShouldNotifyForVersion(notified, ""), "updater notify empty never");
+Check(!PipeSizer.Updater.ShouldNotifyForVersion(notified, "  "), "updater notify whitespace never");
+Console.WriteLine("update auto-check gating: PASS");
 Console.WriteLine("ALL TESTS PASSED");

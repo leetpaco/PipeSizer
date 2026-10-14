@@ -27,30 +27,39 @@ Source: https://github.com/leetpaco/PipeSizer — updates are automatic (see
 
 ## Auto-update
 
-Installed copies check GitHub for a new release on Revit startup and on
-**Check for updates** in the panel. After that, updates are automatic —
-no more hand-copying DLLs.
+Installed copies check GitHub for a new release on Revit startup, on
+**Check for updates** in the panel, and automatically in the background
+while Revit runs (at most once every 30 minutes — turn it off with the
+"Check for updates automatically" checkbox; the manual buttons always
+work). After that, updates are automatic — no more hand-copying DLLs,
+and no more restarting twice.
 
-How it works: Revit locks the loaded DLLs while it runs, so the add-in
-cannot overwrite itself mid-session. Instead, on startup (before the sizing
-code loads) it downloads the new release, verifies each file's SHA256
-against the release's `version.json`, writes the new main DLL as
-`PipeSizer.<version>.dll`, overwrites `PipeSizer.Sizing.dll` in place, and
-rewrites the `.addin` manifest to point at the versioned DLL. The panel
-then shows "Update vX.Y.Z downloaded — restart Revit to apply." A
-**Check for updates** click does the same check but only stages the files;
-the next startup applies them. No network (or any error) silently skips
-the check — startup is never blocked. Stale versioned DLLs are cleaned up
-on startup.
+How it works: Revit locks the loaded main DLL while it runs, but on
+.NET 8 the runtime does not lock loaded assembly *files*, so the running
+session keeps using its in-memory copies while the update is applied in
+place. On startup (before the sizing code loads), or on a **Check for
+updates** click, or on an automatic background check, the add-in
+downloads the new release, verifies each file's SHA256 against the
+release's `version.json`, writes the new main DLL as
+`PipeSizer.<version>.dll`, overwrites `PipeSizer.Sizing.dll` in place,
+and rewrites the `.addin` manifest to point at the versioned DLL. The
+panel then shows "Update vX.Y.Z ready — restart Revit once to apply."
+One restart loads the new version. If overwriting Sizing fails while
+Revit runs, the update falls back to staging the files (the next startup
+applies them), and the notice says two restarts are needed. No network
+(or any error) silently skips the check — startup is never blocked.
+Stale versioned DLLs are cleaned up on startup.
 
 The panel header always shows the running version
 ("PipeSizer — v1.1.2 — live pipe sizing check"), so you can see at a glance
-which build is loaded. When a startup update is staged, Revit also shows a
-"PipeSizer Update" dialog once on first idle ("Update vX.Y.Z downloaded —
-restart Revit to apply") — OK button only, no restart button, since closing
+which build is loaded. When a startup update is applied, Revit also shows a
+"PipeSizer Update" dialog once on first idle ("Update vX.Y.Z ready —
+restart Revit once to apply") — OK button only, no restart button, since closing
 Revit programmatically risks unsaved work. A **Check for updates** click
 shows its outcome as a dialog too, so the result is visible even if the
-pane gets closed.
+pane gets closed. An automatic background check only pops up a dialog
+when a new version was actually applied (once per version per session) —
+otherwise it stays silent.
 
 ## Cutting a release
 
@@ -92,12 +101,16 @@ pane gets closed.
   to Revit's flow. Overrides are session-only, never written to the model
   (check-only). A pipe in an Ignored system can't take an override.
 - **Check for updates** (panel button or ribbon button) checks GitHub for a
-  newer release. The panel immediately shows "Checking for updates…", and
-  the check always ends with a TaskDialog: staged ("Update vX.Y.Z
-  downloaded — restart Revit to apply."), already downloaded, already
-  current, or failed with the reason. HTTP calls time out at 15 s and the
-  whole check is capped at 60 s, so it can never hang silently. The new
-  version loads after one Revit restart.
+  newer release and fully applies it in place. The panel immediately shows
+  "Checking for updates…", and the check always ends with a TaskDialog:
+  ready ("Update vX.Y.Z ready — restart Revit once to apply."), already
+  ready, already downloaded (fallback: two restarts), already current, or
+  failed with the reason. HTTP calls time out at 15 s and the whole check
+  is capped at 60 s, so it can never hang silently. The new version loads
+  after one Revit restart. While Revit runs, an automatic background check
+  does the same at most once every 30 minutes (toggle with the "Check for
+  updates automatically" checkbox); it only pops up when a new version was
+  applied, once per version per session.
 - **Settings** — hydronic/domestic material, velocity + friction limits,
   gas design length, and gas fuel / pressure / material. Changing any setting
   re-checks immediately. Each setting has its own label under Hydronic /

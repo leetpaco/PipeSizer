@@ -29,6 +29,11 @@ public sealed class PipeSizerSettings
     public string DomesticMaterial { get; set; } = Materials.CopperTypeL;
     public bool ShowAll { get; set; } = false;
 
+    /// <summary>Automatic background update check (at most once per 30 min while
+    /// Revit runs). Default ON. The manual ribbon/panel buttons always work
+    /// regardless of this setting. Session-only, like all settings.</summary>
+    public bool AutoUpdateCheck { get; set; } = true;
+
     /// <summary>Per-system category overrides (keyed by system name, case-insensitive).</summary>
     public Dictionary<string, PipeCategory> CategoryOverrides { get; } = new(StringComparer.OrdinalIgnoreCase);
 

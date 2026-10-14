@@ -12,20 +12,36 @@ namespace PipeSizer;
 /// Result of an update check. <see cref="Notice"/> is user-facing text (shown in the
 /// panel); <see cref="Error"/> is only surfaced for an on-demand check the user asked for.
 /// Startup checks fail silently (Noop) so a missing network never blocks Revit.
+///
+/// Two "ready" shapes: <see cref="Applied"/> / <see cref="AlreadyApplied"/> mean the
+/// update is fully applied (versioned main DLL on disk, Sizing overwritten, manifest
+/// rewritten) — one restart loads it. <see cref="Staged"/> / <see cref="AlreadyStaged"/>
+/// mean the files are only downloaded to update-staging/ (the fallback when the
+/// Sizing DLL could not be overwritten while Revit runs) — two restarts are needed
+/// (next launch applies the staged files, the one after loads them).
 /// </summary>
 public sealed record UpdateOutcome(bool UpdateStaged, string? Version, string? Notice, string? Error)
 {
+    /// <summary>Files only staged (fallback): two restarts to load.</summary>
     public static UpdateOutcome Staged(string version) =>
-        new(true, version, $"Update v{version} downloaded — restart Revit to apply.", null);
+        new(true, version, $"Update v{version} downloaded — restart Revit twice to apply.", null);
+
+    /// <summary>Fully applied mid-session: one restart loads it.</summary>
+    public static UpdateOutcome Applied(string version) =>
+        new(true, version, $"Update v{version} ready — restart Revit once to apply.", null);
 
     public static UpdateOutcome AlreadyCurrent(string version) =>
         new(false, version, $"PipeSizer is up to date (v{version}).", null);
 
-    /// <summary>An update is already downloaded and waiting for a restart (previous
-    /// on-demand check staged it, or the startup check downloaded it). Reuses
-    /// UpdateStaged=true so DialogText and the panel notice show the notice.</summary>
+    /// <summary>An update is already downloaded to update-staging/ and waiting
+    /// (previous on-demand check fell back to staging). Two restarts to load.</summary>
     public static UpdateOutcome AlreadyStaged(string version) =>
-        new(true, version, $"Update v{version} already downloaded — restart Revit to apply.", null);
+        new(true, version, $"Update v{version} already downloaded — restart Revit twice to apply.", null);
+
+    /// <summary>An update is already fully applied (manifest points at the newer
+    /// versioned DLL). One restart loads it.</summary>
+    public static UpdateOutcome AlreadyApplied(string version) =>
+        new(true, version, $"Update v{version} already ready — restart Revit once to apply.", null);
 
     public static UpdateOutcome Noop() => new(false, null, null, null);
 
@@ -45,9 +61,15 @@ public sealed record UpdateOutcome(bool UpdateStaged, string? Version, string? N
 ///    the new main DLL as PipeSizer.&lt;version&gt;.dll (never the loaded file),
 ///    overwrite PipeSizer.Sizing.dll in place, and rewrite the .addin manifest's
 ///    &lt;Assembly&gt; to the versioned file. The new main DLL loads next launch.
-///  - On-demand ("Check for updates" button): Sizing IS already loaded, so the
-///    update is only downloaded + verified + staged in update-staging/; the next
-///    startup applies it before anything loads Sizing.
+///  - On-demand ("Check for updates" button) and the automatic background check:
+///    Sizing IS already loaded, so the update is downloaded + verified + FULLY
+///    APPLIED in place (same three writes as startup: versioned main DLL, Sizing,
+///    manifest). On .NET 8 the runtime does not lock loaded assembly files, so the
+///    running session keeps using its in-memory copy and the new files load on the
+///    next launch — one restart. If overwriting Sizing throws, the update falls
+///    back to staging-only in update-staging/ (the next startup applies it, so
+///    that path needs two restarts) and the manifest is left pointing at the
+///    previously working version.
 /// </summary>
 public static class Updater
 {
@@ -110,6 +132,27 @@ public static class Updater
         return version.Revision > 0 ? text + "." + version.Revision : text;
     }
 
+    /// <summary>How often the automatic background check runs (at most once per
+    /// interval, gated on elapsed time in the Idling path).</summary>
+    public static readonly TimeSpan AutoCheckInterval = TimeSpan.FromMinutes(30);
+
+    /// <summary>True when an automatic background update check is due: the last
+    /// check was at least <paramref name="interval"/> ago. A last-check time in
+    /// the future (clock skew) is never due. Pure, unit-tested.</summary>
+    public static bool IsAutoCheckDue(DateTimeOffset lastCheckUtc, DateTimeOffset nowUtc, TimeSpan interval) =>
+        nowUtc >= lastCheckUtc && (nowUtc - lastCheckUtc) >= interval;
+
+    /// <summary>Notify-dedup for the background check: returns true (and records the
+    /// version) the first time a version is seen, false afterwards — so the
+    /// "update ready" popup shows ONCE per version per session. Null/empty
+    /// versions never notify. Pure, unit-tested.</summary>
+    public static bool ShouldNotifyForVersion(HashSet<string> notifiedVersions, string? version)
+    {
+        if (string.IsNullOrWhiteSpace(version))
+            return false;
+        return notifiedVersions.Add(version);
+    }
+
     /// <summary>TaskDialog text for an update-check outcome: the staged notice when
     /// an update was staged, the error on failure, "You're on the latest version
     /// (vX)." when already current, else the notice. Pure logic, so the panel and
@@ -117,7 +160,7 @@ public static class Updater
     public static string DialogText(UpdateOutcome outcome)
     {
         if (outcome.UpdateStaged)
-            return outcome.Notice ?? $"Update v{outcome.Version} downloaded — restart Revit to apply.";
+            return outcome.Notice ?? $"Update v{outcome.Version} ready — restart Revit once to apply.";
         if (outcome.Error is not null)
             return outcome.Error;
         if (outcome.Version is not null)
@@ -235,15 +278,19 @@ public static class Updater
         }
     }
 
-    // ----- On-demand path (Sizing already loaded: stage only) -----
+    // ----- On-demand path (Sizing already loaded: fully apply in place) -----
 
-    /// <summary>On-demand check: download + verify + stage a newer release in
-    /// update-staging/. Does NOT touch the manifest or the loaded Sizing DLL.
-    /// If an update is already downloaded (previous on-demand check staged it, or
-    /// the startup check downloaded it and rewrote the manifest), reports it
-    /// instead of re-downloading. Returns Failed with a message on error
-    /// (the caller shows it).</summary>
-    public static UpdateOutcome CheckAndStageForRestart()
+    /// <summary>On-demand check (manual button or automatic background check):
+    /// download + verify + FULLY APPLY a newer release in place — versioned main
+    /// DLL, Sizing overwrite, manifest rewrite — so one restart loads it. The
+    /// running session keeps using its in-memory copies (.NET 8 does not lock
+    /// loaded assembly files). If overwriting Sizing throws, falls back to
+    /// staging-only in update-staging/ (two restarts to load) and leaves the
+    /// manifest pointing at the previously working version — never a
+    /// half-applied state, never a silent failure. If an update is already
+    /// applied or staged, reports it instead of re-downloading. Returns Failed
+    /// with a message on error (the caller shows it).</summary>
+    public static UpdateOutcome CheckAndApplyForRestart()
     {
         try
         {
@@ -252,22 +299,27 @@ public static class Updater
                 return UpdateOutcome.Failed("Could not locate the Addins folder.");
 
             string current = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0";
+            string manifestPath = Path.Combine(folder, ManifestFile);
 
             var release = GetLatestReleaseAsync().GetAwaiter().GetResult();
             if (release is null)
             {
                 // Offline: a pending update is still worth reporting.
-                string? pendingOffline = GetPendingUpdateVersion(folder, current);
-                return pendingOffline is not null
-                    ? UpdateOutcome.AlreadyStaged(pendingOffline)
+                var pendingOffline = GetPendingUpdate(folder, current);
+                return pendingOffline.Version is not null
+                    ? (pendingOffline.FullyApplied
+                        ? UpdateOutcome.AlreadyApplied(pendingOffline.Version)
+                        : UpdateOutcome.AlreadyStaged(pendingOffline.Version))
                     : UpdateOutcome.Failed("Could not reach GitHub.");
             }
 
-            // Already downloaded and at least as new as the latest release:
+            // Already applied or staged, at least as new as the latest release:
             // report it, never re-download.
-            string? pending = GetPendingUpdateVersion(folder, current);
-            if (pending is not null && CompareVersions(pending, release.TagVersion) >= 0)
-                return UpdateOutcome.AlreadyStaged(pending);
+            var pending = GetPendingUpdate(folder, current);
+            if (pending.Version is not null && CompareVersions(pending.Version, release.TagVersion) >= 0)
+                return pending.FullyApplied
+                    ? UpdateOutcome.AlreadyApplied(pending.Version)
+                    : UpdateOutcome.AlreadyStaged(pending.Version);
 
             if (CompareVersions(release.TagVersion, current) <= 0)
                 return UpdateOutcome.AlreadyCurrent(ParseVersionFromTag(release.Tag) ?? current);
@@ -276,12 +328,18 @@ public static class Updater
             if (bundle is null)
                 return UpdateOutcome.Failed("Could not verify the download (SHA256 mismatch or missing files).");
 
-            string staging = Path.Combine(folder, StagingFolderName);
-            Directory.CreateDirectory(staging);
-            File.WriteAllBytes(Path.Combine(staging, $"PipeSizer.{release.TagVersion}.dll"), bundle.MainDll);
-            File.WriteAllBytes(Path.Combine(staging, SizingAssemblyFile), bundle.SizingDll);
-            File.WriteAllText(Path.Combine(staging, VersionFileName), bundle.VersionJsonText);
-            return UpdateOutcome.Staged(release.TagVersion);
+            var applied = TryApplyBundle(folder, manifestPath, release.TagVersion, bundle);
+            if (applied == ApplyResult.Applied)
+                return UpdateOutcome.Applied(release.TagVersion);
+            if (applied == ApplyResult.SizingWriteFailed)
+            {
+                // Sizing could not be overwritten while Revit runs: fall back to
+                // staging-only (the next startup applies it). The manifest was
+                // left pointing at the previously working version.
+                StageBundle(folder, release.TagVersion, bundle);
+                return UpdateOutcome.Staged(release.TagVersion);
+            }
+            return UpdateOutcome.Failed("Could not apply the update (file write failed).");
         }
         catch (Exception ex)
         {
@@ -289,17 +347,99 @@ public static class Updater
         }
     }
 
-    /// <summary>Version of an update that is already downloaded and waiting for a
-    /// restart, or null. Two sources: a valid (SHA-verified) bundle in
-    /// update-staging/ from a previous on-demand check, or the manifest already
-    /// pointing at a newer versioned DLL (the startup check downloaded it and
-    /// rewrote the manifest). Never throws; corrupt/partial staging is ignored.</summary>
-    public static string? GetPendingUpdateVersion(string folder, string currentVersion)
+    /// <summary>Result of <see cref="TryApplyBundle"/>.</summary>
+    private enum ApplyResult
+    {
+        Applied,
+        /// <summary>The versioned main DLL was written but Sizing could not be
+        /// overwritten (e.g. locked by another process). Caller falls back to
+        /// staging-only; the manifest was NOT touched.</summary>
+        SizingWriteFailed,
+        Failed,
+    }
+
+    /// <summary>Applies a verified bundle in place, in order: versioned main DLL
+    /// (new file — never the loaded one), Sizing overwrite, manifest rewrite.
+    /// On any failure the manifest is left pointing at the previously working
+    /// version; a partially written versioned DLL is removed, and a Sizing
+    /// overwrite that was followed by a manifest failure is rolled back from
+    /// the bytes read before overwriting. Never throws.</summary>
+    private static ApplyResult TryApplyBundle(string folder, string manifestPath, string version, VerifiedBundle bundle)
+    {
+        string versionedName = $"PipeSizer.{version}.dll";
+        string versionedPath = Path.Combine(folder, versionedName);
+        string sizingPath = Path.Combine(folder, SizingAssemblyFile);
+        byte[]? oldSizing = null;
+        bool wroteVersioned = false;
+        try
+        {
+            string loaded = Assembly.GetExecutingAssembly().Location;
+            if (IsSameFile(versionedPath, loaded))
+                return ApplyResult.Failed; // never overwrite the loaded file
+
+            File.WriteAllBytes(versionedPath, bundle.MainDll);
+            wroteVersioned = true;
+
+            try { if (File.Exists(sizingPath)) oldSizing = File.ReadAllBytes(sizingPath); } catch { /* rollback best effort */ }
+            try
+            {
+                File.WriteAllBytes(sizingPath, bundle.SizingDll);
+            }
+            catch
+            {
+                // Sizing could not be overwritten: remove the orphan versioned DLL
+                // and report so the caller can fall back to staging-only.
+                try { if (wroteVersioned) File.Delete(versionedPath); } catch { /* best effort */ }
+                return ApplyResult.SizingWriteFailed;
+            }
+
+            try
+            {
+                RewriteManifest(manifestPath, versionedName);
+            }
+            catch
+            {
+                // Manifest rewrite failed: roll Sizing back to the previous bytes
+                // so the old manifest target + old Sizing stay a working pair.
+                try { if (oldSizing is not null) File.WriteAllBytes(sizingPath, oldSizing); } catch { /* best effort */ }
+                try { if (wroteVersioned) File.Delete(versionedPath); } catch { /* best effort */ }
+                return ApplyResult.Failed;
+            }
+            return ApplyResult.Applied;
+        }
+        catch
+        {
+            try { if (wroteVersioned) File.Delete(versionedPath); } catch { /* best effort */ }
+            return ApplyResult.Failed;
+        }
+    }
+
+    /// <summary>Writes a verified bundle to update-staging/ (fallback path).
+    /// Never throws.</summary>
+    private static void StageBundle(string folder, string version, VerifiedBundle bundle)
     {
         try
         {
-            string? pending = null;
-            // (a) staging dir from a previous on-demand check.
+            string staging = Path.Combine(folder, StagingFolderName);
+            Directory.CreateDirectory(staging);
+            File.WriteAllBytes(Path.Combine(staging, $"PipeSizer.{version}.dll"), bundle.MainDll);
+            File.WriteAllBytes(Path.Combine(staging, SizingAssemblyFile), bundle.SizingDll);
+            File.WriteAllText(Path.Combine(staging, VersionFileName), bundle.VersionJsonText);
+        }
+        catch { /* staging is best effort; the caller already reports Staged */ }
+    }
+
+    /// <summary>An already-downloaded update: its version, and whether it is fully
+    /// applied (manifest already points at the newer versioned DLL — one restart
+    /// loads it) or only staged in update-staging/ (two restarts). When both
+    /// exist, the newer version wins; a tie goes to the fully-applied state.
+    /// Never throws; corrupt/partial staging is ignored.</summary>
+    public static (string? Version, bool FullyApplied) GetPendingUpdate(string folder, string currentVersion)
+    {
+        try
+        {
+            // (a) staging dir from a previous on-demand fallback.
+            string? stagedVersion = null;
             string staging = Path.Combine(folder, StagingFolderName);
             string versionJsonPath = Path.Combine(staging, VersionFileName);
             if (File.Exists(versionJsonPath))
@@ -313,10 +453,12 @@ public static class Updater
                         && VerifySha256(File.ReadAllBytes(stagedMain), manifest.MainSha256)
                         && VerifySha256(File.ReadAllBytes(stagedSizing), manifest.SizingSha256)
                         && CompareVersions(manifest.Version, currentVersion) > 0)
-                        pending = manifest.Version;
+                        stagedVersion = manifest.Version;
                 }
             }
-            // (b) manifest already points at a newer versioned DLL (startup check).
+            // (b) manifest already points at a newer versioned DLL (fully applied:
+            // startup check, or a previous on-demand check applied it in place).
+            string? appliedVersion = null;
             string? manifestAssembly = ReadManifestAssembly(Path.Combine(folder, ManifestFile));
             if (manifestAssembly is not null
                 && manifestAssembly.StartsWith("PipeSizer.", StringComparison.OrdinalIgnoreCase)
@@ -325,17 +467,27 @@ public static class Updater
             {
                 string ver = manifestAssembly["PipeSizer.".Length..^".dll".Length];
                 if (ver.Length > 0 && CompareVersions(ver, currentVersion) > 0
-                    && File.Exists(Path.Combine(folder, manifestAssembly))
-                    && (pending is null || CompareVersions(ver, pending) > 0))
-                    pending = ver;
+                    && File.Exists(Path.Combine(folder, manifestAssembly)))
+                    appliedVersion = ver;
             }
-            return pending;
+            if (appliedVersion is not null
+                && (stagedVersion is null || CompareVersions(appliedVersion, stagedVersion) >= 0))
+                return (appliedVersion, true);
+            if (stagedVersion is not null)
+                return (stagedVersion, false);
+            return (null, false);
         }
         catch
         {
-            return null;
+            return (null, false);
         }
     }
+
+    /// <summary>Version of an update that is already downloaded and waiting for a
+    /// restart, or null. Delegates to <see cref="GetPendingUpdate"/> (the
+    /// FullyApplied distinction is in the caller's outcome, not the version).</summary>
+    public static string? GetPendingUpdateVersion(string folder, string currentVersion) =>
+        GetPendingUpdate(folder, currentVersion).Version;
 
     // ----- Staged-update apply (runs at startup, before Sizing loads) -----
 
@@ -562,7 +714,9 @@ public static class Updater
 
     /// <summary>Startup-only: download + verify + apply in place (Sizing not yet loaded).
     /// <paramref name="currentVersion"/> is the effective version already installed
-    /// (loaded assembly, or a just-applied staged update).</summary>
+    /// (loaded assembly, or a just-applied staged update). Returns Applied when a
+    /// newer release was fully applied, Noop otherwise (already current, offline,
+    /// or any failure — startup never reports update errors).</summary>
     private static UpdateOutcome CheckGitHubAndApply(string folder, string manifestPath, string currentVersion)
     {
         try
@@ -577,16 +731,20 @@ public static class Updater
             if (bundle is null)
                 return UpdateOutcome.Noop();
 
-            string versionedName = $"PipeSizer.{release.TagVersion}.dll";
-            string versionedPath = Path.Combine(folder, versionedName);
-            string loaded = Assembly.GetExecutingAssembly().Location;
-            if (IsSameFile(versionedPath, loaded))
-                return UpdateOutcome.Noop(); // never overwrite the loaded file
+            // The on-demand path may already have fully applied this exact version
+            // (manifest already points at it): skip re-applying, do not re-download,
+            // do not loop. The version check above already covers it when the
+            // loaded assembly IS the applied one; this covers the manifest-ahead
+            // case (manifest points at a newer DLL than the loaded assembly,
+            // e.g. a previous session applied it but Revit loaded the old one).
+            var pending = GetPendingUpdate(folder, currentVersion);
+            if (pending.Version is not null && pending.FullyApplied
+                && CompareVersions(pending.Version, release.TagVersion) >= 0)
+                return UpdateOutcome.Noop();
 
-            File.WriteAllBytes(versionedPath, bundle.MainDll);
-            File.WriteAllBytes(Path.Combine(folder, SizingAssemblyFile), bundle.SizingDll);
-            RewriteManifest(manifestPath, versionedName);
-            return UpdateOutcome.Staged(release.TagVersion);
+            return TryApplyBundle(folder, manifestPath, release.TagVersion, bundle) == ApplyResult.Applied
+                ? UpdateOutcome.Applied(release.TagVersion)
+                : UpdateOutcome.Noop();
         }
         catch
         {

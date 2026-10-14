@@ -45,6 +45,13 @@ public class App : IExternalApplication
     private static bool _startupUpdateDialogRequested;
     private static bool _showStartupUpdateDialog;
     private static string? _startupUpdateNotice;
+    // Automatic background update check: at most once per Updater.AutoCheckInterval,
+    // gated on elapsed time in OnIdling. The check runs off the UI thread and only
+    // surfaces a dialog when a NEW version was applied (deduped per version per
+    // session via _notifiedUpdateVersions) — never spam, never auto-restart.
+    private static DateTime _lastAutoUpdateCheckUtc = DateTime.MinValue;
+    private static bool _autoUpdateCheckRunning;
+    private static readonly HashSet<string> _notifiedUpdateVersions = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<ElementId> _changedAdded = new();
     private static readonly HashSet<ElementId> _changedModified = new();
     private static readonly HashSet<ElementId> _changedDeleted = new();
@@ -98,13 +105,23 @@ public class App : IExternalApplication
                 {
                     _startupUpdateNotice = outcome.Notice;
                     _startupUpdateDialogPending = true;
+                    // Mark notified so the background check doesn't re-announce
+                    // this same version later in the session.
+                    if (outcome.Version is not null)
+                        _ = Updater.ShouldNotifyForVersion(_notifiedUpdateVersions, outcome.Version);
                 }
                 StartupLog("Startup update staged — dialog will show on first Idling run.");
             }
+            // Seed the background-check clock at startup: the startup updater
+            // just checked, so the first automatic check is one interval out.
+            lock (Sync) { _lastAutoUpdateCheckUtc = DateTime.UtcNow; }
         }
         catch (Exception ex)
         {
             StartupLog("Updater FAILED: " + ex.GetType().Name + ": " + ex.Message);
+            // Even on failure, seed the clock so a failed startup check doesn't
+            // trigger an immediate background check on the first Idling run.
+            lock (Sync) { _lastAutoUpdateCheckUtc = DateTime.UtcNow; }
         }
 
         _panel = new PipeSizerPanel();
@@ -203,6 +220,7 @@ public class App : IExternalApplication
     private static void OnIdling(object? sender, IdlingEventArgs e)
     {
         bool raise = false;
+        bool runAutoUpdateCheck = false;
         lock (Sync)
         {
             if (_checkRunning)
@@ -223,6 +241,18 @@ public class App : IExternalApplication
                 _showStartupUpdateDialog = true;
                 raise = true;
             }
+            // Automatic background update check: at most once per interval,
+            // gated on elapsed time (never on every Idling tick), off the UI
+            // thread, never blocking. The manual ribbon/panel buttons always
+            // work regardless of the checkbox.
+            if (!_autoUpdateCheckRunning
+                && (_panel?.Settings.AutoUpdateCheck ?? true)
+                && Updater.IsAutoCheckDue(_lastAutoUpdateCheckUtc, DateTime.UtcNow, Updater.AutoCheckInterval))
+            {
+                _autoUpdateCheckRunning = true;
+                _lastAutoUpdateCheckUtc = DateTime.UtcNow;
+                runAutoUpdateCheck = true;
+            }
             if (_pendingSelect is not null)
             {
                 raise = true; // retry a select whose first raise never executed
@@ -239,6 +269,8 @@ public class App : IExternalApplication
         }
         if (raise)
             _checkEvent?.Raise();
+        if (runAutoUpdateCheck)
+            CheckForUpdatesInBackground();
     }
 
     /// <summary>Called by the panel (any thread) to ask for a fresh check.
@@ -281,10 +313,10 @@ public class App : IExternalApplication
     }
 
     /// <summary>On-demand update check from the panel button / ribbon button.
-    /// Runs off the UI thread; stages (never applies in place) because Sizing is
-    /// already loaded. The outcome is ALWAYS surfaced: panel notice + TaskDialog,
-    /// with every step logged to %TEMP%\PipeSizer-startup.log — no catch block
-    /// here swallows an exception silently.
+    /// Runs off the UI thread; fully applies a newer release in place (one
+    /// restart loads it). The outcome is ALWAYS surfaced: panel notice +
+    /// TaskDialog, with every step logged to %TEMP%\PipeSizer-startup.log —
+    /// no catch block here swallows an exception silently.
     ///
     /// Completion guarantee: the click shows "Checking for updates…" synchronously
     /// (so the click visibly registers even if the background check then hangs),
@@ -305,6 +337,27 @@ public class App : IExternalApplication
         {
             StartupLog("On-demand checking notice FAILED: " + ex.GetType().Name + ": " + ex.Message);
         }
+        RunUpdateCheckAsync(manual: true);
+    }
+
+    /// <summary>Automatic background update check (from the OnIdling interval gate).
+    /// Same check as the manual path, but silent unless a NEW version was applied:
+    /// the popup shows ONCE per version per session (deduped), failures and
+    /// already-current results are only logged. Never auto-restarts. The
+    /// manual buttons always work regardless of the auto-update checkbox.</summary>
+    private static void CheckForUpdatesInBackground()
+    {
+        StartupLog("Background update check started.");
+        RunUpdateCheckAsync(manual: false);
+    }
+
+    /// <summary>Shared update-check core: runs the check on a thread-pool thread
+    /// under the 60 s overall guard, then delivers the outcome. Manual checks
+    /// ALWAYS surface the outcome (panel notice + TaskDialog). Background checks
+    /// only surface it when a version was newly applied that this session has
+    /// not already announced (deduped via Updater.ShouldNotifyForVersion).</summary>
+    private static void RunUpdateCheckAsync(bool manual)
+    {
         var panel = Panel;
         // Fire-and-forget by design: the outcome is delivered via BeginInvoke +
         // TaskDialog, and the 60 s guard caps the wait. Discard documents intent.
@@ -320,7 +373,7 @@ public class App : IExternalApplication
                 {
                     try
                     {
-                        return Updater.CheckAndStageForRestart();
+                        return Updater.CheckAndApplyForRestart();
                     }
                     catch (Exception ex)
                     {
@@ -337,24 +390,54 @@ public class App : IExternalApplication
                 {
                     outcome = UpdateOutcome.Failed(
                         "Timed out after 60 seconds — check your network and try again.");
-                    StartupLog("On-demand update check timed out after 60 s (background check abandoned).");
+                    StartupLog("Update check timed out after 60 s (background check abandoned).");
                 }
-                StartupLog("On-demand update check result: " + outcome);
+                StartupLog("Update check result: " + outcome);
             }
             catch (Exception ex)
             {
                 outcome = UpdateOutcome.Failed(ex.GetType().Name + ": " + ex.Message);
-                StartupLog("On-demand update check threw: " + ex.GetType().Name + ": " + ex.Message);
+                StartupLog("Update check threw: " + ex.GetType().Name + ": " + ex.Message);
             }
-            // ALWAYS surface the outcome: panel notice + TaskDialog, delivered via
-            // BeginInvoke (queued, never blocking) so a stuck UI thread can't
-            // deadlock this background task.
+            finally
+            {
+                if (!manual)
+                {
+                    lock (Sync) { _autoUpdateCheckRunning = false; }
+                }
+            }
+
+            // Delivery: manual checks ALWAYS surface the outcome; background
+            // checks only when a version was newly applied and not yet announced.
+            bool announce;
+            if (manual)
+            {
+                announce = true;
+                if (outcome.Version is not null)
+                {
+                    lock (Sync) { _ = Updater.ShouldNotifyForVersion(_notifiedUpdateVersions, outcome.Version); }
+                }
+            }
+            else
+            {
+                // Dedup set is shared with the manual path: touch it only under lock.
+                lock (Sync)
+                {
+                    announce = outcome.UpdateStaged && outcome.Version is not null &&
+                        Updater.ShouldNotifyForVersion(_notifiedUpdateVersions, outcome.Version);
+                }
+                if (!announce)
+                {
+                    StartupLog("Background update check: no new version to announce; staying silent.");
+                    return;
+                }
+            }
             string dialogText = Updater.DialogText(outcome);
             if (panel is not null)
             {
                 try
                 {
-                    panel.Dispatcher.BeginInvoke(new Action(() =>
+                    _ = panel.Dispatcher.BeginInvoke(new Action(() =>
                     {
                         try
                         {
@@ -362,7 +445,7 @@ public class App : IExternalApplication
                         }
                         catch (Exception ex)
                         {
-                            StartupLog("On-demand panel notice FAILED: " + ex.GetType().Name + ": " + ex.Message);
+                            StartupLog("Update panel notice FAILED: " + ex.GetType().Name + ": " + ex.Message);
                         }
                         // Same outcome as a TaskDialog, so the result is visible even
                         // if the pane gets closed. OK button only — no restart button:
@@ -370,24 +453,24 @@ public class App : IExternalApplication
                         try
                         {
                             TaskDialog.Show("PipeSizer Update", dialogText);
-                            StartupLog("On-demand update dialog shown: " + dialogText);
+                            StartupLog("Update dialog shown: " + dialogText);
                         }
                         catch (Exception ex)
                         {
-                            StartupLog("On-demand update dialog FAILED: " + ex.GetType().Name + ": " + ex.Message);
+                            StartupLog("Update dialog FAILED: " + ex.GetType().Name + ": " + ex.Message);
                         }
                     }));
-                    StartupLog("On-demand update outcome queued to UI thread: " + dialogText);
+                    StartupLog("Update outcome queued to UI thread: " + dialogText);
                 }
                 catch (Exception ex)
                 {
-                    StartupLog("On-demand BeginInvoke FAILED: " + ex.GetType().Name + ": " + ex.Message);
+                    StartupLog("Update BeginInvoke FAILED: " + ex.GetType().Name + ": " + ex.Message);
                     ShowUpdateDialogFallback(dialogText);
                 }
             }
             else
             {
-                StartupLog("On-demand update: panel is null, attempting dialog directly.");
+                StartupLog("Update: panel is null, attempting dialog directly.");
                 ShowUpdateDialogFallback(dialogText);
             }
         });
@@ -400,11 +483,11 @@ public class App : IExternalApplication
         try
         {
             TaskDialog.Show("PipeSizer Update", dialogText);
-            StartupLog("On-demand update dialog shown (fallback): " + dialogText);
+            StartupLog("Update dialog shown (fallback): " + dialogText);
         }
         catch (Exception ex)
         {
-            StartupLog("On-demand fallback dialog FAILED: " + ex.GetType().Name + ": " + ex.Message);
+            StartupLog("Update fallback dialog FAILED: " + ex.GetType().Name + ": " + ex.Message);
         }
     }
 
@@ -600,9 +683,9 @@ public class ShowPaneCommand : IExternalCommand
 /// <summary>
 /// Ribbon button: opens the pane and runs the on-demand update check via the
 /// existing App.CheckForUpdatesOnDemand path (background thread, outcome shown
-/// in the panel). The check stages the new version, but it only loads after a
-/// Revit restart — Revit cannot swap a loaded add-in — and the panel notice
-/// says exactly that.
+/// in the panel + TaskDialog). The check fully applies a newer release in place;
+/// the new version loads after one Revit restart — Revit cannot swap a loaded
+/// add-in — and the panel notice says exactly that.
 /// </summary>
 [Transaction(TransactionMode.Manual)]
 [Regeneration(RegenerationOption.Manual)]

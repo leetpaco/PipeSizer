@@ -42,6 +42,7 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
     private ComboBox _gasMaterial = null!;
     private CheckBox _showAll = null!;
     private CheckBox _pauseLive = null!;
+    private CheckBox _autoUpdateCheck = null!;
     private ListBox _systemsList = null!;
     private ComboBox _systemCategory = null!;
     private TextBlock _overrideLabel = null!;
@@ -312,6 +313,11 @@ public sealed class PipeSizerPanel : UserControl, IDockablePaneProvider
         btnRow.Children.Add(refresh);
         btnRow.Children.Add(updateBtn);
         stack.Children.Add(btnRow);
+
+        _autoUpdateCheck = new CheckBox { Content = "Check for updates automatically", IsChecked = _settings.AutoUpdateCheck, Margin = new Thickness(0, 2, 0, 6) };
+        _autoUpdateCheck.Checked += (_, _) => _settings.AutoUpdateCheck = true;
+        _autoUpdateCheck.Unchecked += (_, _) => _settings.AutoUpdateCheck = false;
+        stack.Children.Add(_autoUpdateCheck);
 
         // --- Systems ---
         stack.Children.Add(SectionTitle("Systems — click one to set its category"));
